@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symbol-matching-poc"
+version = "0.1.0"
+description = "Bare-minimum POC: one-shot symbol matching across PDF drawing pages."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10",
+    "pydantic>=2.5",
+    "pymupdf>=1.24",
+]
+
+[project.optional-dependencies]
+sam3 = [
+    "accelerate>=1.0.0",
+    "huggingface-hub>=0.26.0",
+    "torch>=2.2",
+    "transformers>=4.51.0",
+]
+dino = [
+    "huggingface-hub>=0.26.0",
+    "torch>=2.2",
+    "transformers>=4.51.0",
+]
+ui = [
+    "streamlit>=1.28,<1.41",
+    "streamlit-drawable-canvas>=0.9.3",
+]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+symbol-match = "symbol_matching.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
