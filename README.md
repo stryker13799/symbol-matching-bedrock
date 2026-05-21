@@ -66,9 +66,10 @@ No paid cloud APIs; everything runs locally once dependencies and HF access are 
 
 **Template (`template` and proposal stage of `template+dino`):**
 
-- Per (rotation, scale), keep **local maxima** of the correlation surface above the template threshold (`--min-score`), with a per-variant candidate cap (`max_candidates_per_variant` in code).
-- **Global NMS** across all variants with `--nms-iou`.
+- Per (rotation, scale), keep **local maxima** of the correlation surface above the template threshold (`--min-score`), with caps in code: `max_candidates_per_variant` (200), `max_candidates_per_tile` (120), `max_candidates_before_nms` (2500).
+- **OpenCV NMS** (`cv2.dnn.NMSBoxes`) across all variants with `--nms-iou`.
 - Cap to `--max-hits-per-page`.
+- At low `--min-score` on weak symbols, runtime grows with peak count; use a tighter exemplar box, **`template+dino`**, or fewer scales/rotations.
 
 **`template+dino` (after proposals):**
 
@@ -111,9 +112,31 @@ Per the brief, **false negatives are more costly than false positives** for this
 - **Cap candidates per variant** and **max hits per page** to bound worst-case work.
 - **`template+dino`:** batch DINO forwards (`--dino-batch`); fp16 on CUDA (`--dino-fp16`).
 - **`sam3`:** tile the page, composite with exemplar, optional skip of near-blank tiles, batching, and `--sam3-max-page-side` to reduce tile count.
-- **Drawing-region ONNX (optional, all engines):** with `--yolo-regions`, ONNX (`src/drawing_region_yolo_model/weights.onnx`) proposes the plan area per page. **All engines** search inside the merged ROI and **skip near-blank tiles** there. Writes **`region_overlays/{page_id}_regions.png`** (green = detections, cyan = search ROI). Uses **ONNX Runtime GPU** (`onnxruntime-gpu`, CUDA EP).
+- **Drawing-region ONNX (optional, all engines):** with `--yolo-regions` (CLI default **on**), ONNX (`src/drawing_region_yolo_model/weights.onnx`) proposes the plan area per page. **All engines** search inside the merged ROI and **skip near-blank tiles** there. Writes **`region_overlays/{page_id}_regions.png`** (green = detections, cyan = search ROI). Uses **ONNX Runtime GPU** (`onnxruntime-gpu`, CUDA EP). Region ONNX runs once per page in the main process; the session is dropped after each run.
+- **CPU parallelism (`template` / `template+dino` proposal stage):** optional **tile workers** (parallel OpenCV passes per page) and **page workers** (parallel pages). Pools are capped at **`cpu_count() − 4`** (minimum 1). **Page workers > 1 disables tile workers** (no nested pools). See **§9a**.
+- **GPU memory (SAM3 vs DINO):** only one large vision model stays on GPU at a time; caches are cleared at the end of each run. See **§9b**.
 
 A production system would add **persistent render caches**, **async workers**, and (for embedding search) **precomputed page embeddings** keyed by drawing revision.
+
+### 9a. CPU parallelism (template engines)
+
+| Mode | What runs in parallel | Config |
+|------|------------------------|--------|
+| **Tile workers** | Non-blank tiles on one page (`cv2.matchTemplate` per variant) | `MatcherConfig.tile_workers`, CLI `--tile-workers`, Streamlit **Tile workers** |
+| **Page workers** | Template pass across scoped pages | `run_matching(..., page_workers=...)`, CLI `--page-workers`, Streamlit **Page workers** |
+
+**CLI defaults when flags are `0`:** tile workers = `min(4, cpu_count − 4)`, page workers = `min(2, cpu_count − 4)`.
+
+**Not parallel:** `sam3` engine (`page_workers > 1` errors); DINO rerank after proposals; YOLO region inference; export I/O.
+
+**GPU vs CPU:** template matching is **CPU-only** (OpenCV). GPU helps **region ONNX**, **DINO**, and **SAM3**.
+
+### 9b. GPU memory (SAM3 vs DINO)
+
+- Loading **SAM3** releases cached **DINOv3**; loading **DINO** releases cached **SAM3**.
+- **Start** of each `run_matching`: drop bundles not needed for the selected `--engine`.
+- **End** of each run: clear all SAM3/DINO caches and call `torch.cuda.empty_cache()` (next run reloads weights).
+- **SAM3 exemplar refine** (optional): SAM3 is released before matching when the main engine is `template` or `template+dino`.
 
 ### 10. Data stored for each matched result
 
@@ -232,12 +255,14 @@ Notable flags:
 | `--dpi` | `200` | Render resolution |
 | `--max-pages` | `20` | Safety cap on pages read from the PDF |
 | `--max-search-side` | `3000` | Downscale pages whose longest side exceeds this before template-style matching |
-| `--min-score` | `0.55` | Template correlation threshold (proposal stage); lower → higher recall |
-| `--max-hits-per-page` | `200` | Hard cap on hits emitted per page |
+| `--min-score` | `0.40` | Template correlation threshold (proposal stage); lower → higher recall, slower |
+| `--max-hits-per-page` | `50` | Hard cap on hits emitted per page |
 | `--nms-iou` | `0.30` | IoU threshold for deduplication |
+| `--tile-workers` | `0` → `min(4, CPU−4)` | Template tile process pool; `1` = sequential tiles |
+| `--page-workers` | `0` → `min(2, CPU−4)` | Template page process pool; `>1` disables tile workers |
 | `--scales` | `0.85,0.92,1.0,1.08,1.18` | Multi-scale bank |
 | `--rotations` | `rot4` | `rot4`, `0`, or comma-separated degrees |
-| `--engine` | `template` | `template`, `template+dino`, or `sam3` |
+| `--engine` | `template+dino` | `template`, `template+dino`, or `sam3` |
 | `--use-sam3-refine` | off | Tighten exemplar bbox on reference page with SAM3 |
 | `--dino-model` | `facebook/dinov3-vits16-pretrain-lvd1689m` | Weights for `template+dino` |
 | `--dino-min-cosine` | `0.55` | Minimum exemplar–crop cosine to keep a hit |
@@ -247,10 +272,18 @@ Notable flags:
 | `--sam3-max-page-side` | `3200` | Cap longest page side (work pixels) before SAM3 tiling; `0` = native (slow) |
 | `--sam3-batch` | `8` | Composites per SAM3 forward |
 | `--sam3-no-skip-blank` | off | Disable fast skip of near-white tiles |
-| `--yolo-regions` | off | Restrict search to ONNX drawing-region ROI per page |
-| `--yolo-onnx` | `src/drawing_region_yolo_model/weights.onnx` | Region detector ONNX path |
+| `--yolo-regions` / `--no-yolo-regions` | **on** | Restrict search to ONNX drawing-region ROI per page |
+| `--yolo-onnx` | bundled `weights.onnx` | Region detector ONNX path |
 | `--yolo-conf` | `0.25` | Region detection confidence |
+| `--yolo-padding-frac` | `0.02` | Pad merged drawing ROI (fraction of page size) |
 | `--yolo-ort-device` | `cuda` | ONNX Runtime EP: `cuda` or `cpu` |
+
+Example (multi-page template + parallelism):
+
+```powershell
+symbol-match --pdf "Sample_Input\....pdf" --reference-page 1 --bbox "6391,1124,6450,1183" `
+  --engine template --scope same_page_type --tile-workers 4 --page-workers 2 --output-dir exports\par_run
+```
 
 Example (`template+dino`):
 
@@ -270,10 +303,15 @@ streamlit run app.py
 
 Upload a PDF (or rely on the sample in `Sample_Input/`), pick reference page, draw a rectangle on the zoomed canvas, choose scope and engine, run. Results: table (sorted by `score`), downloadable JSON, per-page overlay images, and a simple hit explorer.
 
+For **`template`** or **`template+dino`**, the sidebar includes **Tile workers** and **Page workers** (max = CPU count − 4). Use page workers for multi-sheet scopes; tile workers for one large page. **SAM3** does not use this CPU pool.
+
+Switching engines in one Streamlit session releases the previous engine’s GPU weights after each run (see **§9b**).
+
 ---
 
 ## Tests
 
 ```powershell
 pytest -q
+pytest -q -m "not integration"   # skip live ONNX / CUDA tests
 ```
