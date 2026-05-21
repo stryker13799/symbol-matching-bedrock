@@ -1,0 +1,7 @@
+onnx=F:\Bedrock.cv Interview\src\drawing_region_yolo_model\weights.onnx conf=0.25 dpi=150
+page 1: 1 region(s), coverage 39.3% (5400x3600)
+  [0] xyxy=(1141,520,4107,3096) area=39.3%
+page 2: 1 region(s), coverage 48.9% (5400x3600)
+  [0] xyxy=(572,472,4274,3040) area=48.9%
+page 3: 1 region(s), coverage 56.0% (5400x3600)
+  [0] xyxy=(833,302,4164,3572) area=56.0%

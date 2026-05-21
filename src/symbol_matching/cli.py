@@ -63,15 +63,15 @@ def _parse_rotations(raw: str) -> Tuple[int, ...]:
 @click.option("--dpi", type=int, default=200, show_default=True)
 @click.option("--max-pages", type=int, default=20, show_default=True)
 @click.option("--max-search-side", type=int, default=3000, show_default=True)
-@click.option("--min-score", type=float, default=0.55, show_default=True,
+@click.option("--min-score", type=float, default=0.40, show_default=True,
               help="Lower for higher recall.")
 @click.option("--nms-iou", type=float, default=0.30, show_default=True)
-@click.option("--max-hits-per-page", type=int, default=200, show_default=True)
+@click.option("--max-hits-per-page", type=int, default=50, show_default=True)
 @click.option("--scales", "scales_raw", type=str, default="0.85,0.92,1.0,1.08,1.18",
               show_default=True)
 @click.option("--rotations", "rotations_raw", type=str, default="rot4", show_default=True,
               help="'rot4' for 0/90/180/270, '0' for none, or 'a,b,c'.")
-@click.option("--engine", "engine", type=click.Choice(ALL_ENGINES), default=ENGINE_TEMPLATE,
+@click.option("--engine", "engine", type=click.Choice(ALL_ENGINES), default=ENGINE_TEMPLATE_DINO,
               show_default=True, help="template: OpenCV only. template+dino: template then "
               "DINOv3 cosine rerank (GPU recommended). sam3: composite-tile SAM3.")
 @click.option("--use-sam3-refine", is_flag=True, default=False,
@@ -96,6 +96,16 @@ def _parse_rotations(raw: str) -> Tuple[int, ...]:
               help="Composites per SAM3 forward (raise until OOM on your GPU).")
 @click.option("--sam3-no-skip-blank", is_flag=True, default=False,
               help="Run SAM3 on every tile including near-white margins.")
+@click.option("--yolo-regions/--no-yolo-regions", default=True, show_default=True,
+              help="Restrict search to YOLO 'drawing' region(s) per page (training-matched preprocess).")
+@click.option("--yolo-onnx", type=click.Path(path_type=Path), default=None,
+              help="Path to drawing-region ONNX model. Default: src/drawing_region_yolo_model/weights.onnx")
+@click.option("--yolo-conf", default=0.25, type=float, show_default=True,
+              help="Drawing-region detection confidence threshold.")
+@click.option("--yolo-padding-frac", default=0.02, type=float, show_default=True,
+              help="Pad merged drawing ROI by this fraction of page width/height.")
+@click.option("--yolo-ort-device", default="cuda", show_default=True,
+              help="ONNX Runtime device for region model: cuda or cpu.")
 @click.option("--dino-model", default="facebook/dinov3-vits16-pretrain-lvd1689m", show_default=True,
               help="DINOv3 model id for --engine template+dino.")
 @click.option("--dino-min-cosine", default=0.55, type=float, show_default=True,
@@ -132,6 +142,11 @@ def main(
     sam3_max_page_side: int,
     sam3_batch: int,
     sam3_no_skip_blank: bool,
+    yolo_regions: bool,
+    yolo_onnx: Optional[Path],
+    yolo_conf: float,
+    yolo_padding_frac: float,
+    yolo_ort_device: str,
     dino_model: str,
     dino_min_cosine: float,
     dino_batch: int,
@@ -147,6 +162,9 @@ def main(
         nms_iou=nms_iou,
         max_hits_per_page=max_hits_per_page,
         max_search_side=max_search_side,
+        tile_size=sam3_tile,
+        tile_overlap=sam3_overlap,
+        skip_blank_tiles=not sam3_no_skip_blank,
     )
 
     click.echo(f"Rendering {pdf_path.name} at {dpi} DPI (max {max_pages} pages)...")
@@ -190,6 +208,25 @@ def main(
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    from symbol_matching.region_proposal import (
+        RegionProposalConfig,
+        default_region_onnx_path,
+    )
+
+    onnx_path = yolo_onnx if yolo_onnx is not None else default_region_onnx_path()
+    region_cfg = RegionProposalConfig(
+        enabled=yolo_regions,
+        onnx_path=onnx_path,
+        conf=yolo_conf,
+        padding_frac=yolo_padding_frac,
+        ort_device=yolo_ort_device,
+    )
+    if yolo_regions:
+        click.echo(
+            f"Drawing-region ONNX: {onnx_path}, conf={yolo_conf}, "
+            f"padding_frac={yolo_padding_frac}, ort_device={yolo_ort_device}"
+        )
 
     sam3_engine_cfg = None
     dino_engine_cfg = None
@@ -244,12 +281,15 @@ def main(
         progress_cb=lambda msg: click.echo(msg),
         dino_rerank_config=dino_engine_cfg,
         dino_hf_token=hf_token,
+        region_config=region_cfg,
     )
 
     click.echo(f"Done. {len(hits)} match(es) across {len(export.searched_page_ids)} page(s).")
     click.echo(f"  JSON:     {artifacts.export_path}")
     click.echo(f"  Crops:    {artifacts.crops_dir}")
     click.echo(f"  Overlays: {artifacts.overlays_dir}")
+    if artifacts.region_overlays_dir is not None:
+        click.echo(f"  Regions:  {artifacts.region_overlays_dir}")
 
 
 if __name__ == "__main__":

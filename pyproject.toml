@@ -33,7 +33,14 @@ ui = [
     "streamlit>=1.28,<1.41",
     "streamlit-drawable-canvas>=0.9.3",
 ]
-dev = ["pytest>=7.4"]
+region = [
+    "onnxruntime-gpu>=1.17",
+]
+export-region = [
+    "onnxruntime-gpu>=1.17",
+    "ultralytics>=8.4",
+]
+dev = ["pytest>=7.4", "onnxruntime-gpu>=1.17"]
 
 [project.scripts]
 symbol-match = "symbol_matching.cli:main"
@@ -47,3 +54,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: loads ONNX weights (run with pytest -m integration)",
+]

@@ -54,7 +54,7 @@ No paid cloud APIs; everything runs locally once dependencies and HF access are 
 2. **Optional:** SAM 3 segmentation on that page only → replace loose user box with a tighter mask bbox.
 3. **Binarize** the crop (adaptive threshold) → ink mask; **trim** to tight ink bounds with small padding.
 4. **Template bank:** one mask per combination of configured **rotations** (default `0/90/180/270`) and **scales** (default `0.85 … 1.18`); scales and rotations are user-tunable.
-5. For **`template` / `template+dino`:** each bank variant is slid over each target page’s ink mask (after optional downscale — see performance). For **`sam3`:** exemplar and page tiles are fed through the SAM 3 image pipeline per the engine implementation.
+5. For **`template` / `template+dino`:** each bank variant is slid over each target page’s ink mask **inside the search ROI**, using the same **tile grid + near-blank tile skip** as SAM3 (defaults: 768 px tiles, 192 px overlap). For **`sam3`:** exemplar and page tiles are fed through the SAM 3 image pipeline inside the ROI.
 
 ### 4. How we search across pages
 
@@ -111,6 +111,7 @@ Per the brief, **false negatives are more costly than false positives** for this
 - **Cap candidates per variant** and **max hits per page** to bound worst-case work.
 - **`template+dino`:** batch DINO forwards (`--dino-batch`); fp16 on CUDA (`--dino-fp16`).
 - **`sam3`:** tile the page, composite with exemplar, optional skip of near-blank tiles, batching, and `--sam3-max-page-side` to reduce tile count.
+- **Drawing-region ONNX (optional, all engines):** with `--yolo-regions`, ONNX (`src/drawing_region_yolo_model/weights.onnx`) proposes the plan area per page. **All engines** search inside the merged ROI and **skip near-blank tiles** there. Writes **`region_overlays/{page_id}_regions.png`** (green = detections, cyan = search ROI). Uses **ONNX Runtime GPU** (`onnxruntime-gpu`, CUDA EP).
 
 A production system would add **persistent render caches**, **async workers**, and (for embedding search) **precomputed page embeddings** keyed by drawing revision.
 
@@ -198,6 +199,13 @@ Optional extras:
 uv pip install -e ".[dev,ui]"       # Streamlit UI
 uv pip install -e ".[dev,sam3]"    # torch + transformers + accelerate (SAM3)
 uv pip install -e ".[dev,dino]"    # torch + transformers (DINOv3; overlaps sam3 deps)
+uv pip install -e ".[dev,region]"  # onnxruntime-gpu for drawing-region proposals
+```
+
+Export region ONNX once from the bundled `.pt` (requires `export-region` extra / ultralytics):
+
+```powershell
+python scripts/export_region_onnx.py
 ```
 
 Set **`HF_TOKEN`** or **`HUGGING_FACE_HUB_TOKEN`** for gated Hugging Face models (SAM 3, DINOv3 LVD weights).
@@ -239,6 +247,10 @@ Notable flags:
 | `--sam3-max-page-side` | `3200` | Cap longest page side (work pixels) before SAM3 tiling; `0` = native (slow) |
 | `--sam3-batch` | `8` | Composites per SAM3 forward |
 | `--sam3-no-skip-blank` | off | Disable fast skip of near-white tiles |
+| `--yolo-regions` | off | Restrict search to ONNX drawing-region ROI per page |
+| `--yolo-onnx` | `src/drawing_region_yolo_model/weights.onnx` | Region detector ONNX path |
+| `--yolo-conf` | `0.25` | Region detection confidence |
+| `--yolo-ort-device` | `cuda` | ONNX Runtime EP: `cuda` or `cpu` |
 
 Example (`template+dino`):
 

@@ -18,11 +18,6 @@ SAM 3 grounds the concept from the exemplar region and returns instance boxes
 across the *entire* composite. We drop any detection that overlaps the
 exemplar region and map the rest back to full-page coordinates, then run
 non-maximum suppression across overlapping tiles.
-
-This is a documented hack, not a blessed API path. It works because SAM 3 was
-trained on image-exemplar prompts, but expect occasional noise — keep the
-score threshold meaningful and use NMS aggressively. GPU + fp16 is strongly
-preferred; on CPU a single page takes minutes.
 """
 
 from __future__ import annotations
@@ -35,6 +30,7 @@ from PIL import Image
 
 from symbol_matching.models import BBox, MatchHit
 from symbol_matching.sam3 import load_sam3_bundle, resolve_hf_token
+from symbol_matching.tiling import full_page_bbox, tile_is_blank, tile_origins
 
 DEFAULT_SAM3_MODEL_ID = "facebook/sam3"
 
@@ -114,34 +110,13 @@ def _resize_rgb_uniform(rgb: np.ndarray, scale: float) -> np.ndarray:
     )
 
 
-def _tile_is_blank(tile_rgb: np.ndarray, max_mean: float, max_std: float) -> bool:
-    gray = np.asarray(Image.fromarray(tile_rgb).convert("L"), dtype=np.float32)
-    m = float(np.mean(gray))
-    s = float(np.std(gray))
-    return m >= max_mean and s <= max_std
-
-
-def _tile_origins(page_h: int, page_w: int, tile_size: int, overlap: int) -> List[Tuple[int, int]]:
-    """Return (x, y) top-left origins covering the page with the given overlap."""
-    if tile_size <= overlap:
-        raise ValueError("tile_size must exceed overlap")
-    stride = tile_size - overlap
-    xs: List[int] = []
-    x = 0
-    while x + tile_size < page_w:
-        xs.append(x)
-        x += stride
-    xs.append(max(0, page_w - tile_size))
-    ys: List[int] = []
-    y = 0
-    while y + tile_size < page_h:
-        ys.append(y)
-        y += stride
-    ys.append(max(0, page_h - tile_size))
-    # Deduplicate (small pages collapse to single tile).
-    xs = sorted(set(xs))
-    ys = sorted(set(ys))
-    return [(x, y) for y in ys for x in xs]
+def _bbox_to_work(bbox: BBox, work_scale: float) -> BBox:
+    return BBox(
+        x1=bbox.x1 * work_scale,
+        y1=bbox.y1 * work_scale,
+        x2=bbox.x2 * work_scale,
+        y2=bbox.y2 * work_scale,
+    )
 
 
 def _build_composite(
@@ -237,6 +212,7 @@ def match_exemplar_on_page_with_sam3(
     model: object,
     processor: object,
     progress_cb: Optional[callable] = None,
+    search_rois: Optional[List[BBox]] = None,
 ) -> List[MatchHit]:
     """Cross-page SAM 3 matching for one page using composite tiles."""
     import torch
@@ -262,18 +238,33 @@ def match_exemplar_on_page_with_sam3(
             "lower exemplar_max_side or raise composite_size"
         )
 
-    origins = _tile_origins(phw, pww, effective_tile, min(config.tile_overlap, effective_tile - 1))
-    # Filter blank tiles before counting batches (progress is meaningful).
+    page_h_full, page_w_full = page_rgb.shape[:2]
+    rois_page = search_rois if search_rois is not None else [
+        full_page_bbox(page_w_full, page_h_full)
+    ]
     filtered_origins: List[Tuple[int, int]] = []
-    for ox, oy in origins:
-        tile = page_work[oy : oy + effective_tile, ox : ox + effective_tile]
-        if tile.shape[0] < 4 or tile.shape[1] < 4:
+    overlap = min(config.tile_overlap, effective_tile - 1)
+    for roi_page in rois_page:
+        roi_work = _bbox_to_work(roi_page, work_scale)
+        rx1 = int(max(0, np.floor(roi_work.x1)))
+        ry1 = int(max(0, np.floor(roi_work.y1)))
+        rx2 = int(min(pww, np.ceil(roi_work.x2)))
+        ry2 = int(min(phw, np.ceil(roi_work.y2)))
+        roi_w = rx2 - rx1
+        roi_h = ry2 - ry1
+        if roi_w < 4 or roi_h < 4:
             continue
-        if config.skip_blank_tiles and _tile_is_blank(
-            tile, config.blank_tile_max_mean, config.blank_tile_max_std
-        ):
-            continue
-        filtered_origins.append((ox, oy))
+        roi_work_rgb = page_work[ry1:ry2, rx1:rx2]
+        local_origins = tile_origins(roi_h, roi_w, effective_tile, overlap)
+        for lx, ly in local_origins:
+            tile = roi_work_rgb[ly : ly + effective_tile, lx : lx + effective_tile]
+            if tile.shape[0] < 4 or tile.shape[1] < 4:
+                continue
+            if config.skip_blank_tiles and tile_is_blank(
+                tile, config.blank_tile_max_mean, config.blank_tile_max_std
+            ):
+                continue
+            filtered_origins.append((rx1 + lx, ry1 + ly))
 
     all_boxes: List[BBox] = []
     all_scores: List[float] = []

@@ -196,6 +196,15 @@ def _show_results(state: Dict[str, Any], page_records: List[PageRecord]) -> None
         key="explorer_page",
     )
 
+    if artifacts.region_overlays_dir is not None:
+        region_path = artifacts.region_overlays_dir / f"{sel_page_id}_regions.png"
+        if region_path.is_file():
+            st.image(
+                str(region_path),
+                caption=f"ONNX region proposals — {sel_page_id} (green=detection, cyan=search ROI)",
+                use_container_width=True,
+            )
+
     overlay_path = artifacts.overlays_dir / f"{sel_page_id}.png"
     if overlay_path.is_file():
         st.image(str(overlay_path), caption=f"All hits — {sel_page_id}", use_container_width=True)
@@ -273,6 +282,21 @@ def main() -> None:
         nms_iou = float(st.slider("NMS IoU", 0.1, 0.9, 0.30, 0.05))
         max_hits = int(st.number_input("Max hits per page", min_value=1, max_value=500, value=200))
 
+        st.header("Drawing region (YOLO)")
+        use_yolo_regions = st.checkbox(
+            "Limit search to YOLO drawing region (ONNX)",
+            value=False,
+            help="Lightweight ONNX region detector per page (training-matched preprocess). "
+            "Search runs inside the merged ROI; SAM3 still skips near-blank tiles there.",
+        )
+        yolo_conf = float(st.slider("YOLO region conf", 0.10, 0.90, 0.25, 0.05))
+        yolo_ort_device = st.selectbox("Region ONNX device", ["cuda", "cpu"], index=0)
+
+        st.header("Search tiling (all engines)")
+        search_tile = int(st.number_input("Tile size (work px)", 256, 1500, 768, 32))
+        search_overlap = int(st.number_input("Tile overlap (work px)", 0, 600, 192, 16))
+        search_skip_blank = st.checkbox("Skip near-blank tiles", value=True)
+
         if engine == ENGINE_TEMPLATE:
             min_score = float(st.slider("Score threshold", 0.30, 0.95, 0.55, 0.01))
             use_rot4 = st.checkbox("Search 0/90/180/270 rotations", value=True)
@@ -299,8 +323,6 @@ def main() -> None:
             dino_fp16 = st.checkbox("DINO fp16 on CUDA", value=True)
         else:
             min_score = float(st.slider("SAM3 score threshold", 0.20, 0.90, 0.40, 0.01))
-            sam3_tile = int(st.number_input("SAM3 tile size (page px)", 256, 1500, 768, 32))
-            sam3_overlap = int(st.number_input("SAM3 tile overlap (page px)", 0, 600, 192, 16))
             sam3_exemplar_side = int(st.number_input("SAM3 exemplar max side", 80, 400, 200, 10))
             sam3_fp16 = st.checkbox("Use fp16 on CUDA", value=True)
             sam3_max_page_side = int(
@@ -314,7 +336,6 @@ def main() -> None:
                 )
             )
             sam3_batch = int(st.number_input("SAM3 batch size", 1, 16, 8, 1))
-            sam3_skip_blank = st.checkbox("Skip near-blank tiles", value=True)
             use_rot4 = True
             scale_min, scale_max, scale_steps = 0.85, 1.18, 5
 
@@ -482,6 +503,9 @@ def main() -> None:
         score_threshold=min_score,
         nms_iou=nms_iou,
         max_hits_per_page=max_hits,
+        tile_size=search_tile,
+        tile_overlap=search_overlap,
+        skip_blank_tiles=search_skip_blank,
     )
 
     refined_bbox: Optional[BBox] = None
@@ -499,6 +523,18 @@ def main() -> None:
 
     out_dir = _PROJECT_ROOT / "exports" / "streamlit_run"
 
+    from symbol_matching.region_proposal import (
+        RegionProposalConfig,
+        default_region_onnx_path,
+    )
+
+    region_cfg = RegionProposalConfig(
+        enabled=use_yolo_regions,
+        onnx_path=default_region_onnx_path(),
+        conf=yolo_conf,
+        ort_device=yolo_ort_device,
+    )
+
     sam3_engine_cfg = None
     dino_engine_cfg = None
     if engine == ENGINE_TEMPLATE_DINO:
@@ -513,8 +549,8 @@ def main() -> None:
         from symbol_matching.sam3_engine import Sam3EngineConfig
 
         sam3_engine_cfg = Sam3EngineConfig(
-            tile_size=sam3_tile,
-            tile_overlap=sam3_overlap,
+            tile_size=search_tile,
+            tile_overlap=search_overlap,
             composite_size=1008,
             exemplar_max_side=sam3_exemplar_side,
             score_threshold=min_score,
@@ -523,7 +559,7 @@ def main() -> None:
             use_fp16=sam3_fp16,
             batch_size=sam3_batch,
             max_page_infer_side=sam3_max_page_side,
-            skip_blank_tiles=sam3_skip_blank,
+            skip_blank_tiles=search_skip_blank,
         )
 
     spinner_label = f"Matching across {len(searched)} page(s) with engine '{engine}'..."
@@ -540,6 +576,7 @@ def main() -> None:
             engine=engine,
             sam3_engine_config=sam3_engine_cfg,
             dino_rerank_config=dino_engine_cfg,
+            region_config=region_cfg,
         )
 
     st.session_state["hits"] = hits

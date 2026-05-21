@@ -1,19 +1,15 @@
-"""One-shot symbol matching via binary template matching with TTA.
-
-The exemplar crop is binarized into an "ink" mask, then matched against each
-page's ink mask at multiple scales and 0/90/180/270 rotations. This is a
-deterministic baseline that works well for clean construction-drawing symbols.
-"""
+"""One-shot symbol matching via binary template matching with TTA."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from symbol_matching.models import BBox, MatchHit
+from symbol_matching.tiling import full_page_bbox, tile_is_blank, tile_origins
 
 
 @dataclass(frozen=True)
@@ -23,17 +19,17 @@ class MatcherConfig:
     score_threshold: float = 0.55
     nms_iou: float = 0.30
     max_hits_per_page: int = 200
-    # Pages are downscaled so their longest side is at most this many pixels
-    # before matching; templates scale to match.
     max_search_side: int = 3000
-    # Per (rotation, scale) variant: cap candidates kept before global NMS.
     max_candidates_per_variant: int = 500
+    tile_size: int = 768
+    tile_overlap: int = 192
+    skip_blank_tiles: bool = True
+    blank_tile_max_mean: float = 252.0
+    blank_tile_max_std: float = 3.0
 
 
 def _to_ink_mask(rgb: np.ndarray) -> np.ndarray:
-    """Return a uint8 mask where 'ink' pixels are 255 and background is 0."""
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    # Adaptive threshold handles uneven background / scanned drawings.
     binary = cv2.adaptiveThreshold(
         gray,
         maxValue=255,
@@ -46,7 +42,6 @@ def _to_ink_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def _trim_to_ink(mask: np.ndarray, padding: int) -> Tuple[np.ndarray, Tuple[int, int]]:
-    """Crop ``mask`` tightly around non-zero pixels with a small padding margin."""
     ys, xs = np.where(mask > 0)
     if ys.size == 0:
         return mask, (0, 0)
@@ -100,10 +95,6 @@ def build_template_bank(
     exemplar_rgb: np.ndarray,
     config: MatcherConfig,
 ) -> List[Tuple[np.ndarray, int, float]]:
-    """Build (mask, rotation_deg, scale) variants of the exemplar.
-
-    Returns variants that have a usable amount of ink content.
-    """
     mask = _to_ink_mask(exemplar_rgb)
     trimmed, _ = _trim_to_ink(mask, padding=2)
     if trimmed.size == 0 or trimmed.shape[0] < 4 or trimmed.shape[1] < 4:
@@ -118,37 +109,28 @@ def build_template_bank(
     return bank
 
 
-def match_exemplar_on_page(
-    page_rgb: np.ndarray,
+def _match_variants_on_tile(
+    tile_mask: np.ndarray,
     template_bank: Sequence[Tuple[np.ndarray, int, float]],
     config: MatcherConfig,
-) -> List[MatchHit]:
-    """Search one page for every template variant; return NMS-filtered hits."""
-    page_h, page_w = page_rgb.shape[:2]
-    page_scale = _scale_for_page(page_h, page_w, config.max_search_side)
-    if page_scale < 1.0:
-        work = cv2.resize(
-            page_rgb,
-            (max(1, int(round(page_w * page_scale))), max(1, int(round(page_h * page_scale)))),
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        work = page_rgb
-    work_mask = _to_ink_mask(work)
-    work_h, work_w = work_mask.shape
-
+    page_scale: float,
+    tile_offset_x: float,
+    tile_offset_y: float,
+    roi_offset_x: float,
+    roi_offset_y: float,
+) -> Tuple[List[BBox], List[float], List[str]]:
+    work_h, work_w = tile_mask.shape
     boxes: List[BBox] = []
     scores: List[float] = []
     sources: List[str] = []
+    inv = 1.0 / page_scale if page_scale < 1.0 else 1.0
 
     for tmpl, rot, scale in template_bank:
         scaled_tmpl = _scale_mask(tmpl, page_scale) if page_scale < 1.0 else tmpl
         th, tw = scaled_tmpl.shape
         if th < 4 or tw < 4 or th > work_h or tw > work_w:
             continue
-        result = cv2.matchTemplate(work_mask, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
-        # Keep only pixels that are both above-threshold and a local maximum,
-        # which collapses each peak to one candidate point.
+        result = cv2.matchTemplate(tile_mask, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
         peak_radius = max(3, min(th, tw) // 3)
         kernel = np.ones((peak_radius, peak_radius), dtype=np.uint8)
         dilated = cv2.dilate(result, kernel)
@@ -162,19 +144,94 @@ def match_exemplar_on_page(
                 -config.max_candidates_per_variant:
             ]
             ys, xs, cand_scores = ys[top_idx], xs[top_idx], cand_scores[top_idx]
-        inv = 1.0 / page_scale if page_scale < 1.0 else 1.0
         source_tag = f"template:rot{rot}:s{scale:.2f}"
         for y, x, sc in zip(ys.tolist(), xs.tolist(), cand_scores.tolist()):
+            wx = float(x) + tile_offset_x
+            wy = float(y) + tile_offset_y
             boxes.append(
                 BBox(
-                    x1=float(x) * inv,
-                    y1=float(y) * inv,
-                    x2=float(x + tw) * inv,
-                    y2=float(y + th) * inv,
+                    x1=wx * inv + roi_offset_x,
+                    y1=wy * inv + roi_offset_y,
+                    x2=(wx + float(tw)) * inv + roi_offset_x,
+                    y2=(wy + float(th)) * inv + roi_offset_y,
                 )
             )
             scores.append(float(sc))
             sources.append(source_tag)
+    return boxes, scores, sources
+
+
+def match_exemplar_on_page(
+    page_rgb: np.ndarray,
+    template_bank: Sequence[Tuple[np.ndarray, int, float]],
+    config: MatcherConfig,
+    search_rois: Optional[List[BBox]] = None,
+) -> List[MatchHit]:
+    """Search inside region ROI(s) using tiled ink matching; skip near-blank tiles."""
+    page_h, page_w = page_rgb.shape[:2]
+    rois = search_rois if search_rois is not None else [full_page_bbox(page_w, page_h)]
+    if len(rois) != 1:
+        raise ValueError("template engine expects a single search ROI (union of regions)")
+    roi = rois[0]
+    rx1 = int(max(0, np.floor(roi.x1)))
+    ry1 = int(max(0, np.floor(roi.y1)))
+    rx2 = int(min(page_w, np.ceil(roi.x2)))
+    ry2 = int(min(page_h, np.ceil(roi.y2)))
+    search_rgb = page_rgb[ry1:ry2, rx1:rx2]
+    if search_rgb.size == 0:
+        return []
+    roi_offset_x = float(rx1)
+    roi_offset_y = float(ry1)
+
+    page_scale = _scale_for_page(search_rgb.shape[0], search_rgb.shape[1], config.max_search_side)
+    if page_scale < 1.0:
+        work_rgb = cv2.resize(
+            search_rgb,
+            (
+                max(1, int(round(search_rgb.shape[1] * page_scale))),
+                max(1, int(round(search_rgb.shape[0] * page_scale))),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        work_rgb = search_rgb
+    work_mask = _to_ink_mask(work_rgb)
+    work_h, work_w = work_mask.shape
+
+    if config.tile_size <= 0:
+        raise ValueError("tile_size must be positive")
+    overlap = min(config.tile_overlap, config.tile_size - 1)
+    origins = tile_origins(work_h, work_w, config.tile_size, overlap)
+
+    boxes: List[BBox] = []
+    scores: List[float] = []
+    sources: List[str] = []
+
+    for ox, oy in origins:
+        tile_mask = work_mask[oy : oy + config.tile_size, ox : ox + config.tile_size]
+        if tile_mask.shape[0] < 4 or tile_mask.shape[1] < 4:
+            continue
+        if config.skip_blank_tiles:
+            tile_rgb = work_rgb[oy : oy + config.tile_size, ox : ox + config.tile_size]
+            if tile_is_blank(
+                tile_rgb,
+                config.blank_tile_max_mean,
+                config.blank_tile_max_std,
+            ):
+                continue
+        t_boxes, t_scores, t_sources = _match_variants_on_tile(
+            tile_mask,
+            template_bank,
+            config,
+            page_scale,
+            float(ox),
+            float(oy),
+            roi_offset_x,
+            roi_offset_y,
+        )
+        boxes.extend(t_boxes)
+        scores.extend(t_scores)
+        sources.extend(t_sources)
 
     if len(boxes) == 0:
         return []

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -32,6 +32,41 @@ def crop_rgb(image_rgb: np.ndarray, bbox: BBox) -> np.ndarray:
 def save_png(image_rgb: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(image_rgb).save(path, format="PNG")
+
+
+def draw_region_proposals_on_page(
+    page_rgb: np.ndarray,
+    detections: Sequence[Tuple[BBox, float]],
+    search_rois: Sequence[BBox],
+) -> np.ndarray:
+    """Overlay ONNX region detections (green) and merged search ROI (cyan)."""
+    pil = Image.fromarray(page_rgb.copy())
+    drawer = ImageDraw.Draw(pil)
+    line_w = max(2, min(page_rgb.shape[:2]) // 600)
+    for bbox, conf in detections:
+        drawer.rectangle(
+            [(bbox.x1, bbox.y1), (bbox.x2, bbox.y2)],
+            outline=(80, 200, 80),
+            width=line_w,
+        )
+        drawer.text(
+            (bbox.x1 + 4, bbox.y1 + 4),
+            f"drawing {conf:.2f}",
+            fill=(80, 200, 80),
+        )
+    roi_w = max(3, line_w + 1)
+    for roi in search_rois:
+        drawer.rectangle(
+            [(roi.x1, roi.y1), (roi.x2, roi.y2)],
+            outline=(0, 200, 255),
+            width=roi_w,
+        )
+        drawer.text(
+            (roi.x1 + 6, max(0.0, roi.y1 - 18)),
+            "search ROI",
+            fill=(0, 200, 255),
+        )
+    return np.asarray(pil, dtype=np.uint8)
 
 
 def draw_hits_on_page(page_rgb: np.ndarray, hits: List[MatchHit]) -> np.ndarray:

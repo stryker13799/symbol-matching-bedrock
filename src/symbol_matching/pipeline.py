@@ -23,7 +23,18 @@ from symbol_matching.models import (
     RunExport,
 )
 from symbol_matching.pdf import RenderedPage
-from symbol_matching.viz import crop_rgb, draw_hits_on_page, save_png
+from symbol_matching.region_proposal import (
+    RegionProposalConfig,
+    load_region_model,
+    resolve_page_regions,
+)
+from symbol_matching.tiling import full_page_bbox
+from symbol_matching.viz import (
+    crop_rgb,
+    draw_hits_on_page,
+    draw_region_proposals_on_page,
+    save_png,
+)
 
 ENGINE_TEMPLATE = "template"
 ENGINE_TEMPLATE_DINO = "template+dino"
@@ -38,6 +49,7 @@ class RunArtifacts:
     export_path: Path
     crops_dir: Path
     overlays_dir: Path
+    region_overlays_dir: Optional[Path]
 
 
 def _clamp_bbox(bbox: BBox, page: PageRecord) -> BBox:
@@ -123,6 +135,7 @@ def run_matching(
     sam3_hf_token: Optional[str] = None,
     dino_rerank_config: Optional[object] = None,
     dino_hf_token: Optional[str] = None,
+    region_config: Optional[RegionProposalConfig] = None,
     progress_cb: Optional[callable] = None,
 ) -> Tuple[List[MatchHit], RunExport, RunArtifacts]:
     """Run end-to-end matching and write JSON + crops + annotated overlays.
@@ -147,19 +160,50 @@ def run_matching(
     overlays_dir = output_dir / "overlays"
     crops_dir.mkdir(parents=True, exist_ok=True)
     overlays_dir.mkdir(parents=True, exist_ok=True)
+    region_overlays_dir: Optional[Path] = None
+    if region_config is not None and region_config.enabled:
+        region_overlays_dir = output_dir / "region_overlays"
+        region_overlays_dir.mkdir(parents=True, exist_ok=True)
 
     all_hits: List[MatchHit] = []
     enriched: List[Tuple[PageRecord, MatchHit, Path]] = []
     model_path: str
 
+    r_cfg = region_config if region_config is not None else RegionProposalConfig(enabled=False)
+    region_detector: Optional[object] = None
+    if r_cfg.enabled:
+        region_detector = load_region_model(r_cfg)
+        model_path_suffix = f"+onnx-region:{r_cfg.onnx_path.name}"
+    else:
+        model_path_suffix = ""
+
+    def _page_regions(page_rgb: np.ndarray) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+        if not r_cfg.enabled:
+            page_h, page_w = page_rgb.shape[:2]
+            return [], [full_page_bbox(page_w, page_h)]
+        return resolve_page_regions(page_rgb, r_cfg, region_detector)
+
+    def _save_region_overlay(page: PageRecord, page_rgb: np.ndarray) -> None:
+        if region_overlays_dir is None:
+            return
+        scored, search_rois = _page_regions(page_rgb)
+        overlay = draw_region_proposals_on_page(page_rgb, scored, search_rois)
+        save_png(overlay, region_overlays_dir / f"{page.id}_regions.png")
+
     if engine == ENGINE_TEMPLATE:
         template_bank = build_template_bank(exemplar_crop, matcher_config)
-        model_path = "opencv:matchTemplate:binary-ink"
+        model_path = f"opencv:matchTemplate:binary-ink{model_path_suffix}"
         for page in searched_pages:
             if page.id not in page_index:
                 continue
             page_rgb = page_index[page.id].image_rgb
-            raw_hits = match_exemplar_on_page(page_rgb, template_bank, matcher_config)
+            _save_region_overlay(page, page_rgb)
+            _, search_rois = _page_regions(page_rgb)
+            if progress_cb is not None and r_cfg.enabled:
+                progress_cb(f"template: page {page.id} — ONNX region ROI + tiled search")
+            raw_hits = match_exemplar_on_page(
+                page_rgb, template_bank, matcher_config, search_rois=search_rois
+            )
             page_hits, page_enriched = _persist_page_hits(
                 page, page_rgb, raw_hits, crops_dir, overlays_dir
             )
@@ -175,14 +219,21 @@ def run_matching(
         template_bank = build_template_bank(exemplar_crop, matcher_config)
         d_cfg = dino_rerank_config if dino_rerank_config is not None else DinoRerankConfig()
         dino_model, dino_processor = load_dinov3_bundle(d_cfg.model_id, dino_hf_token)
-        model_path = f"opencv:matchTemplate+{d_cfg.model_id}:cosine-rerank"
+        model_path = f"opencv:matchTemplate+{d_cfg.model_id}:cosine-rerank{model_path_suffix}"
         for page in searched_pages:
             if page.id not in page_index:
                 continue
             page_rgb = page_index[page.id].image_rgb
+            _save_region_overlay(page, page_rgb)
+            _, search_rois = _page_regions(page_rgb)
             if progress_cb is not None:
-                progress_cb(f"template+dino: page {page.id} ({page.sheet_ref}) — template pass…")
-            raw_template = match_exemplar_on_page(page_rgb, template_bank, matcher_config)
+                progress_cb(
+                    f"template+dino: page {page.id} ({page.sheet_ref}) — "
+                    f"{'ONNX ROI + ' if r_cfg.enabled else ''}tiled template pass…"
+                )
+            raw_template = match_exemplar_on_page(
+                page_rgb, template_bank, matcher_config, search_rois=search_rois
+            )
             if progress_cb is not None:
                 progress_cb(
                     f"  {page.id}: {len(raw_template)} template hit(s) → DINOv3 rerank…"
@@ -213,20 +264,28 @@ def run_matching(
         model, processor = load_sam3_engine(sam3_model_id, sam3_hf_token)
         model_path = (
             f"huggingface:{sam3_model_id}:composite-tile"
-            f"+fp16={sam3_engine_config.use_fp16}"
+            f"+fp16={sam3_engine_config.use_fp16}{model_path_suffix}"
         )
         for page in searched_pages:
             if page.id not in page_index:
                 continue
             page_rgb = page_index[page.id].image_rgb
+            _save_region_overlay(page, page_rgb)
+            _, search_rois = _page_regions(page_rgb)
             if progress_cb is not None:
-                progress_cb(f"sam3: page {page.id} ({page.sheet_ref}) — work_side≤{sam3_engine_config.max_page_infer_side}, batch={sam3_engine_config.batch_size}")
+                progress_cb(
+                    f"sam3: page {page.id} ({page.sheet_ref}) — "
+                    f"work_side≤{sam3_engine_config.max_page_infer_side}, "
+                    f"batch={sam3_engine_config.batch_size}"
+                    f"{', ONNX ROI' if r_cfg.enabled else ''}"
+                )
             raw_hits = match_exemplar_on_page_with_sam3(
                 page_rgb=page_rgb,
                 exemplar_rgb=exemplar_crop,
                 config=sam3_engine_config,
                 model=model,
                 processor=processor,
+                search_rois=search_rois,
                 progress_cb=(
                     (
                         lambda b_done, b_total, n_tiles, pid=page.id: progress_cb(
@@ -260,5 +319,6 @@ def run_matching(
         export_path=export_path,
         crops_dir=crops_dir,
         overlays_dir=overlays_dir,
+        region_overlays_dir=region_overlays_dir,
     )
     return all_hits, export, artifacts
