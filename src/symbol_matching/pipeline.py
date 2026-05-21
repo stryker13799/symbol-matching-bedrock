@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from symbol_matching.matcher import (
     MatcherConfig,
+    _template_match_page_entry,
     build_template_bank,
     match_exemplar_on_page,
+    resolve_parallel_workers,
 )
 from symbol_matching.models import (
     BBox,
@@ -23,6 +26,7 @@ from symbol_matching.models import (
     RunExport,
 )
 from symbol_matching.pdf import RenderedPage
+from symbol_matching.gpu_memory import release_all_gpu_bundles, release_gpu_bundles_except
 from symbol_matching.region_proposal import (
     RegionProposalConfig,
     load_region_model,
@@ -92,6 +96,50 @@ def _hits_to_drawing_items(
     return items
 
 
+def _run_template_page_pass(
+    page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]],
+    template_bank: Sequence[Tuple[np.ndarray, int, float]],
+    match_cfg: MatcherConfig,
+    page_match_cfg: MatcherConfig,
+    page_workers: int,
+    progress_cb: Optional[Callable[[str], None]],
+    progress_label: str,
+) -> List[Tuple[PageRecord, np.ndarray, List[MatchHit]]]:
+    """Template match each page; tile-parallel or page-parallel, not both."""
+    bank_list = list(template_bank)
+    if page_workers <= 1:
+        results: List[Tuple[PageRecord, np.ndarray, List[MatchHit]]] = []
+        for page, page_rgb, search_rois in page_jobs:
+            if progress_cb is not None:
+                progress_cb(f"{progress_label}: page {page.id}")
+            raw_hits = match_exemplar_on_page(
+                page_rgb, bank_list, match_cfg, search_rois=search_rois
+            )
+            results.append((page, page_rgb, raw_hits))
+        return results
+
+    payloads = [
+        (page_rgb, bank_list, page_match_cfg, search_rois)
+        for _, page_rgb, search_rois in page_jobs
+    ]
+    raw_by_index: Dict[int, List[MatchHit]] = {}
+    with ProcessPoolExecutor(max_workers=page_workers) as pool:
+        future_to_idx = {
+            pool.submit(_template_match_page_entry, payloads[i]): i
+            for i in range(len(payloads))
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            raw_by_index[idx] = future.result()
+            if progress_cb is not None:
+                page = page_jobs[idx][0]
+                progress_cb(f"{progress_label}: finished page {page.id}")
+    return [
+        (page_jobs[i][0], page_jobs[i][1], raw_by_index[i])
+        for i in range(len(page_jobs))
+    ]
+
+
 def _persist_page_hits(
     page: PageRecord,
     page_rgb: np.ndarray,
@@ -137,6 +185,7 @@ def run_matching(
     dino_hf_token: Optional[str] = None,
     region_config: Optional[RegionProposalConfig] = None,
     progress_cb: Optional[callable] = None,
+    page_workers: int = 1,
 ) -> Tuple[List[MatchHit], RunExport, RunArtifacts]:
     """Run end-to-end matching and write JSON + crops + annotated overlays.
 
@@ -147,6 +196,28 @@ def run_matching(
     """
     if engine not in ALL_ENGINES:
         raise ValueError(f"unsupported engine: {engine}; choose from {ALL_ENGINES}")
+    if page_workers > 1 and engine == ENGINE_SAM3:
+        raise ValueError(
+            "page_workers > 1 is not supported for engine sam3 (single GPU model); "
+            "use page_workers=1 or engine template / template+dino"
+        )
+
+    if engine == ENGINE_TEMPLATE:
+        release_gpu_bundles_except(None)
+    elif engine == ENGINE_TEMPLATE_DINO:
+        release_gpu_bundles_except("dino")
+    elif engine == ENGINE_SAM3:
+        release_gpu_bundles_except("sam3")
+
+    tile_workers, effective_page_workers = resolve_parallel_workers(
+        matcher_config.tile_workers, page_workers
+    )
+    match_cfg = matcher_config
+    if tile_workers != matcher_config.tile_workers:
+        match_cfg = replace(matcher_config, tile_workers=tile_workers)
+    page_match_cfg = match_cfg
+    if effective_page_workers > 1:
+        page_match_cfg = replace(match_cfg, tile_workers=1)
 
     page_index: Dict[str, RenderedPage] = {p.record.id: p for p in rendered}
     if reference_page_id not in page_index:
@@ -177,33 +248,53 @@ def run_matching(
     else:
         model_path_suffix = ""
 
-    def _page_regions(page_rgb: np.ndarray) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+    region_cache: Dict[str, Tuple[List[Tuple[BBox, float]], List[BBox]]] = {}
+
+    def _page_regions(
+        page_id: str, page_rgb: np.ndarray
+    ) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+        cached = region_cache.get(page_id)
+        if cached is not None:
+            return cached
         if not r_cfg.enabled:
             page_h, page_w = page_rgb.shape[:2]
-            return [], [full_page_bbox(page_w, page_h)]
-        return resolve_page_regions(page_rgb, r_cfg, region_detector)
+            result: Tuple[List[Tuple[BBox, float]], List[BBox]] = (
+                [],
+                [full_page_bbox(page_w, page_h)],
+            )
+        else:
+            result = resolve_page_regions(page_rgb, r_cfg, region_detector)
+        region_cache[page_id] = result
+        return result
 
     def _save_region_overlay(page: PageRecord, page_rgb: np.ndarray) -> None:
         if region_overlays_dir is None:
             return
-        scored, search_rois = _page_regions(page_rgb)
+        scored, search_rois = _page_regions(page.id, page_rgb)
         overlay = draw_region_proposals_on_page(page_rgb, scored, search_rois)
         save_png(overlay, region_overlays_dir / f"{page.id}_regions.png")
 
     if engine == ENGINE_TEMPLATE:
-        template_bank = build_template_bank(exemplar_crop, matcher_config)
+        template_bank = build_template_bank(exemplar_crop, match_cfg)
         model_path = f"opencv:matchTemplate:binary-ink{model_path_suffix}"
+        page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]] = []
         for page in searched_pages:
             if page.id not in page_index:
                 continue
             page_rgb = page_index[page.id].image_rgb
             _save_region_overlay(page, page_rgb)
-            _, search_rois = _page_regions(page_rgb)
-            if progress_cb is not None and r_cfg.enabled:
-                progress_cb(f"template: page {page.id} — ONNX region ROI + tiled search")
-            raw_hits = match_exemplar_on_page(
-                page_rgb, template_bank, matcher_config, search_rois=search_rois
-            )
+            _, search_rois = _page_regions(page.id, page_rgb)
+            page_jobs.append((page, page_rgb, search_rois))
+        template_results = _run_template_page_pass(
+            page_jobs,
+            template_bank,
+            match_cfg,
+            page_match_cfg,
+            effective_page_workers,
+            progress_cb,
+            "template",
+        )
+        for page, page_rgb, raw_hits in template_results:
             page_hits, page_enriched = _persist_page_hits(
                 page, page_rgb, raw_hits, crops_dir, overlays_dir
             )
@@ -216,24 +307,28 @@ def run_matching(
             rerank_template_hits_on_page,
         )
 
-        template_bank = build_template_bank(exemplar_crop, matcher_config)
+        template_bank = build_template_bank(exemplar_crop, match_cfg)
         d_cfg = dino_rerank_config if dino_rerank_config is not None else DinoRerankConfig()
         dino_model, dino_processor = load_dinov3_bundle(d_cfg.model_id, dino_hf_token)
         model_path = f"opencv:matchTemplate+{d_cfg.model_id}:cosine-rerank{model_path_suffix}"
+        dino_page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]] = []
         for page in searched_pages:
             if page.id not in page_index:
                 continue
             page_rgb = page_index[page.id].image_rgb
             _save_region_overlay(page, page_rgb)
-            _, search_rois = _page_regions(page_rgb)
-            if progress_cb is not None:
-                progress_cb(
-                    f"template+dino: page {page.id} ({page.sheet_ref}) — "
-                    f"{'ONNX ROI + ' if r_cfg.enabled else ''}tiled template pass…"
-                )
-            raw_template = match_exemplar_on_page(
-                page_rgb, template_bank, matcher_config, search_rois=search_rois
-            )
+            _, search_rois = _page_regions(page.id, page_rgb)
+            dino_page_jobs.append((page, page_rgb, search_rois))
+        template_results = _run_template_page_pass(
+            dino_page_jobs,
+            template_bank,
+            match_cfg,
+            page_match_cfg,
+            effective_page_workers,
+            progress_cb,
+            "template+dino",
+        )
+        for page, page_rgb, raw_template in template_results:
             if progress_cb is not None:
                 progress_cb(
                     f"  {page.id}: {len(raw_template)} template hit(s) → DINOv3 rerank…"
@@ -246,7 +341,7 @@ def run_matching(
                 dino_processor,
                 d_cfg,
             )
-            raw_reranked = raw_reranked[: matcher_config.max_hits_per_page]
+            raw_reranked = raw_reranked[: match_cfg.max_hits_per_page]
             page_hits, page_enriched = _persist_page_hits(
                 page, page_rgb, raw_reranked, crops_dir, overlays_dir
             )
@@ -271,7 +366,7 @@ def run_matching(
                 continue
             page_rgb = page_index[page.id].image_rgb
             _save_region_overlay(page, page_rgb)
-            _, search_rois = _page_regions(page_rgb)
+            _, search_rois = _page_regions(page.id, page_rgb)
             if progress_cb is not None:
                 progress_cb(
                     f"sam3: page {page.id} ({page.sheet_ref}) — "
@@ -302,6 +397,10 @@ def run_matching(
             enriched.extend(page_enriched)
     else:
         raise ValueError(f"unsupported engine: {engine}")
+
+    if region_detector is not None:
+        del region_detector
+    release_all_gpu_bundles()
 
     export = RunExport(
         reference_page_id=ref_page.record.id,

@@ -4,17 +4,16 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
+import cv2
 import numpy as np
-from PIL import Image
 
 from symbol_matching.models import BBox
 
 
 def tile_is_blank(tile_rgb: np.ndarray, max_mean: float, max_std: float) -> bool:
-    gray = np.asarray(Image.fromarray(tile_rgb).convert("L"), dtype=np.float32)
-    m = float(np.mean(gray))
-    s = float(np.std(gray))
-    return m >= max_mean and s <= max_std
+    gray = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2GRAY)
+    mean, stddev = cv2.meanStdDev(gray)
+    return float(mean[0, 0]) >= max_mean and float(stddev[0, 0]) <= max_std
 
 
 def tile_origins(

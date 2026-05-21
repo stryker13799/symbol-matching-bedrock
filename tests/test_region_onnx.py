@@ -18,10 +18,19 @@ from symbol_matching.region_proposal import (
 
 
 def test_infer_rgb_to_nchw_shape() -> None:
-    rgb = np.zeros((TRAIN_IMGSZ, TRAIN_IMGSZ, 3), dtype=np.uint8)
-    tensor = infer_rgb_to_nchw_float(rgb)
+    gray = np.zeros((TRAIN_IMGSZ, TRAIN_IMGSZ), dtype=np.uint8)
+    tensor = infer_rgb_to_nchw_float(gray)
     assert tensor.shape == (1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ)
     assert tensor.max() <= 1.0
+
+
+def test_preprocess_returns_grayscale_640() -> None:
+    page = np.full((720, 1280, 3), 200, dtype=np.uint8)
+    gray, scale_x, scale_y = preprocess_training_matched(page)
+    assert gray.shape == (TRAIN_IMGSZ, TRAIN_IMGSZ)
+    assert gray.ndim == 2
+    assert scale_x > 0.0
+    assert scale_y > 0.0
 
 
 def test_parse_yolo_onnx_output_filters_low_conf() -> None:
@@ -42,8 +51,8 @@ def test_live_onnx_detector_on_blank_page() -> None:
     detector = load_region_detector(cfg)
     assert "CUDAExecutionProvider" in detector.active_providers
     page = np.full((360, 540, 3), 255, dtype=np.uint8)
-    infer_rgb, _, _ = preprocess_training_matched(page)
-    hits = detector.detect_640(infer_rgb, 0.25, 0.45, 50)
+    gray640, _, _ = preprocess_training_matched(page)
+    hits = detector.detect_640(gray640, 0.25, 0.45, 50)
     assert isinstance(hits, list)
 
 
@@ -54,10 +63,10 @@ def test_live_onnx_matches_exported_output_layout() -> None:
         pytest.skip(f"ONNX weights missing: {onnx_path}")
     det = OnnxRegionDetector(onnx_path, ort_device="cuda")
     assert det.active_providers[0] == "CUDAExecutionProvider"
-    infer_rgb, _, _ = preprocess_training_matched(
+    gray640, _, _ = preprocess_training_matched(
         np.full((3600, 5400, 3), 240, dtype=np.uint8)
     )
-    hits = det.detect_640(infer_rgb, 0.25, 0.45, 50)
+    hits = det.detect_640(gray640, 0.25, 0.45, 50)
     for x1, y1, x2, y2, score in hits:
         assert 0.0 <= x1 < x2 <= TRAIN_IMGSZ
         assert 0.0 <= y1 < y2 <= TRAIN_IMGSZ

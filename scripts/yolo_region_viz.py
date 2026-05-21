@@ -78,13 +78,14 @@ def main() -> None:
     for page_index in range(page_count):
         page_rgb, page_w, page_h = _render_page_rgb(args.pdf, page_index, args.dpi)
         scored, search_rois = resolve_page_regions(page_rgb, cfg, detector)
-        infer_rgb, _, _ = preprocess_training_matched(page_rgb)
+        gray640, _, _ = preprocess_training_matched(page_rgb)
         overlay = draw_region_proposals_on_page(page_rgb, scored, search_rois)
         boxes_page = [bbox for bbox, _ in scored]
         stem = f"page_{page_index + 1:03d}"
         Image.fromarray(page_rgb).save(args.out_dir / f"{stem}_input.png")
         Image.fromarray(overlay).save(args.out_dir / f"{stem}_regions.png")
-        Image.fromarray(infer_rgb).save(args.out_dir / f"{stem}_infer_640_gray.png")
+        infer_viz = np.dstack([gray640, gray640, gray640])
+        Image.fromarray(infer_viz).save(args.out_dir / f"{stem}_infer_640_gray.png")
 
         page_area = float(page_w * page_h)
         covered = sum(b.area() for b in boxes_page)

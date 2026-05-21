@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -80,10 +81,7 @@ def _resize_rgb_long_side(rgb: np.ndarray, max_side: int) -> np.ndarray:
     scale = float(max_side) / float(longest)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
-    return np.asarray(
-        Image.fromarray(rgb).resize((new_w, new_h), Image.Resampling.LANCZOS),
-        dtype=np.uint8,
-    )
+    return cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
 
 def _uniform_work_scale(ph: int, pw: int, max_infer_side: int) -> float:
@@ -104,10 +102,7 @@ def _resize_rgb_uniform(rgb: np.ndarray, scale: float) -> np.ndarray:
     h, w = rgb.shape[:2]
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
-    return np.asarray(
-        Image.fromarray(rgb).resize((new_w, new_h), Image.Resampling.LANCZOS),
-        dtype=np.uint8,
-    )
+    return cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
 
 def _bbox_to_work(bbox: BBox, work_scale: float) -> BBox:
@@ -123,10 +118,11 @@ def _build_composite(
     tile_rgb: np.ndarray,
     exemplar_rgb: np.ndarray,
     config: Sam3EngineConfig,
-) -> Tuple[np.ndarray, BBox]:
-    """Paste the tile + exemplar onto a white canvas. Return (canvas, exemplar_bbox)."""
+    canvas: np.ndarray,
+) -> BBox:
+    """Paste tile + exemplar onto ``canvas`` (reused buffer). Return exemplar bbox."""
     size = config.composite_size
-    canvas = np.full((size, size, 3), 255, dtype=np.uint8)
+    canvas.fill(255)
     th, tw = tile_rgb.shape[:2]
     eh, ew = exemplar_rgb.shape[:2]
 
@@ -141,13 +137,12 @@ def _build_composite(
         ex_y = size - eh - config.exemplar_pad_px
     canvas[ex_y : ex_y + eh, ex_x : ex_x + ew] = exemplar_rgb
 
-    exemplar_bbox = BBox(
+    return BBox(
         x1=float(ex_x),
         y1=float(ex_y),
         x2=float(ex_x + ew),
         y2=float(ex_y + eh),
     )
-    return canvas, exemplar_bbox
 
 
 def _detect_on_composite_batch(
@@ -215,8 +210,6 @@ def match_exemplar_on_page_with_sam3(
     search_rois: Optional[List[BBox]] = None,
 ) -> List[MatchHit]:
     """Cross-page SAM 3 matching for one page using composite tiles."""
-    import torch
-
     ph, pw = page_rgb.shape[:2]
     work_scale = _uniform_work_scale(ph, pw, config.max_page_infer_side)
     page_work = _resize_rgb_uniform(page_rgb, work_scale)
@@ -272,16 +265,21 @@ def match_exemplar_on_page_with_sam3(
     batch_size = max(1, int(config.batch_size))
     n_batches = (len(filtered_origins) + batch_size - 1) // batch_size
     inv_work = 1.0 / work_scale
+    composite_bufs = [
+        np.full((config.composite_size, config.composite_size, 3), 255, dtype=np.uint8)
+        for _ in range(batch_size)
+    ]
 
     for b_idx, start in enumerate(range(0, len(filtered_origins), batch_size)):
         chunk = filtered_origins[start : start + batch_size]
         composites: List[np.ndarray] = []
         ex_bboxes: List[BBox] = []
         tile_origins_chunk: List[Tuple[int, int]] = []
-        for (tx, ty) in chunk:
+        for slot, (tx, ty) in enumerate(chunk):
             tile = page_work[ty : ty + effective_tile, tx : tx + effective_tile]
-            composite, ex_bbox = _build_composite(tile, exemplar_display, config)
-            composites.append(composite)
+            buf = composite_bufs[slot]
+            ex_bbox = _build_composite(tile, exemplar_display, config, buf)
+            composites.append(buf)
             ex_bboxes.append(ex_bbox)
             tile_origins_chunk.append((tx, ty))
 
@@ -291,8 +289,6 @@ def match_exemplar_on_page_with_sam3(
         if progress_cb is not None:
             progress_cb(b_idx + 1, n_batches, len(filtered_origins))
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         batch_detections = _detect_on_composite_batch(
             composites, ex_bboxes, model, processor, config
         )

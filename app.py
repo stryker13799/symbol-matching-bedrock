@@ -10,7 +10,7 @@ import streamlit as st
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-from symbol_matching.matcher import MatcherConfig
+from symbol_matching.matcher import MatcherConfig, max_parallel_workers
 from symbol_matching.models import BBox, MatchHit, PageRecord
 from symbol_matching.pdf import RenderedPage, render_pdf
 from symbol_matching.pipeline import ENGINE_SAM3, ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO, run_matching
@@ -297,8 +297,38 @@ def main() -> None:
         search_overlap = int(st.number_input("Tile overlap (work px)", 0, 600, 192, 16))
         search_skip_blank = st.checkbox("Skip near-blank tiles", value=True)
 
+        parallel_cap = max_parallel_workers()
+        template_tile_workers = 1
+        template_page_workers = 1
+        if engine in (ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO):
+            st.subheader("Template CPU parallelism")
+            template_tile_workers = int(
+                st.number_input(
+                    "Tile workers",
+                    min_value=1,
+                    max_value=parallel_cap,
+                    value=min(4, parallel_cap),
+                    step=1,
+                    help="Parallel OpenCV template passes per page (capped at CPU count − 4).",
+                )
+            )
+            template_page_workers = int(
+                st.number_input(
+                    "Page workers",
+                    min_value=1,
+                    max_value=parallel_cap,
+                    value=min(2, parallel_cap),
+                    step=1,
+                    help="Parallel pages for template pass; disables tile workers when > 1.",
+                )
+            )
+
         if engine == ENGINE_TEMPLATE:
             min_score = float(st.slider("Score threshold", 0.30, 0.95, 0.55, 0.01))
+            st.caption(
+                "Lower thresholds (e.g. below 0.5) on weak symbols produce many "
+                "correlation peaks and run longer; tighten the exemplar box or use "
+            )
             use_rot4 = st.checkbox("Search 0/90/180/270 rotations", value=True)
             scale_min = float(st.slider("Scale min", 0.5, 1.0, 0.85, 0.01))
             scale_max = float(st.slider("Scale max", 1.0, 1.5, 1.18, 0.01))
@@ -497,15 +527,18 @@ def main() -> None:
         return
 
     scale_factors = tuple(float(s) for s in np.linspace(scale_min, scale_max, scale_steps))
+    template_peak_div = 2 if min_score < 0.5 else 3
     config = MatcherConfig(
         scales=scale_factors,
         rotations_deg=(0, 90, 180, 270) if use_rot4 else (0,),
         score_threshold=min_score,
         nms_iou=nms_iou,
         max_hits_per_page=max_hits,
+        peak_size_divisor=template_peak_div,
         tile_size=search_tile,
         tile_overlap=search_overlap,
         skip_blank_tiles=search_skip_blank,
+        tile_workers=template_tile_workers,
     )
 
     refined_bbox: Optional[BBox] = None
@@ -520,6 +553,10 @@ def main() -> None:
                 hf_token=None,
                 score_threshold=0.5,
             )
+        if engine != ENGINE_SAM3:
+            from symbol_matching.sam3 import release_sam3_bundle
+
+            release_sam3_bundle()
 
     out_dir = _PROJECT_ROOT / "exports" / "streamlit_run"
 
@@ -577,6 +614,7 @@ def main() -> None:
             sam3_engine_config=sam3_engine_cfg,
             dino_rerank_config=dino_engine_cfg,
             region_config=region_cfg,
+            page_workers=template_page_workers,
         )
 
     st.session_state["hits"] = hits

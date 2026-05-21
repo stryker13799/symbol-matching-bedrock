@@ -19,6 +19,7 @@ def _score_to_rgb(score: float) -> Tuple[int, int, int]:
 
 
 def crop_rgb(image_rgb: np.ndarray, bbox: BBox) -> np.ndarray:
+    """Return a view into ``image_rgb`` (caller must keep the parent array alive)."""
     h, w = image_rgb.shape[:2]
     x1 = int(max(0, np.floor(bbox.x1)))
     y1 = int(max(0, np.floor(bbox.y1)))
@@ -26,11 +27,21 @@ def crop_rgb(image_rgb: np.ndarray, bbox: BBox) -> np.ndarray:
     y2 = int(min(h, np.ceil(bbox.y2)))
     if x2 <= x1 or y2 <= y1:
         raise ValueError(f"empty crop for bbox {bbox} on image {w}x{h}")
-    return image_rgb[y1:y2, x1:x2].copy()
+    return image_rgb[y1:y2, x1:x2]
+
+
+def crop_rgb_owned(image_rgb: np.ndarray, bbox: BBox) -> np.ndarray:
+    """Return a compact owned crop (releases dependency on the full page buffer)."""
+    crop = crop_rgb(image_rgb, bbox)
+    if crop.flags["C_CONTIGUOUS"] and crop.flags["OWNDATA"]:
+        return crop
+    return np.ascontiguousarray(crop)
 
 
 def save_png(image_rgb: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not image_rgb.flags["C_CONTIGUOUS"]:
+        image_rgb = np.ascontiguousarray(image_rgb)
     Image.fromarray(image_rgb).save(path, format="PNG")
 
 

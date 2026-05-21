@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import click
 
-from symbol_matching.matcher import MatcherConfig
+from symbol_matching.matcher import MatcherConfig, max_parallel_workers
 from symbol_matching.models import BBox
 from symbol_matching.pdf import render_pdf
 from symbol_matching.pipeline import (
@@ -67,6 +67,11 @@ def _parse_rotations(raw: str) -> Tuple[int, ...]:
               help="Lower for higher recall.")
 @click.option("--nms-iou", type=float, default=0.30, show_default=True)
 @click.option("--max-hits-per-page", type=int, default=50, show_default=True)
+@click.option("--tile-workers", type=int, default=0, show_default=True,
+              help="Template tile process pool size; 0 uses min(4, CPU count − 4).")
+@click.option("--page-workers", type=int, default=0, show_default=True,
+              help="Template page process pool size; 0 uses min(2, CPU count − 4). "
+              "Page parallelism disables tile parallelism.")
 @click.option("--scales", "scales_raw", type=str, default="0.85,0.92,1.0,1.08,1.18",
               show_default=True)
 @click.option("--rotations", "rotations_raw", type=str, default="rot4", show_default=True,
@@ -128,6 +133,8 @@ def main(
     min_score: float,
     nms_iou: float,
     max_hits_per_page: int,
+    tile_workers: int,
+    page_workers: int,
     scales_raw: str,
     rotations_raw: str,
     engine: str,
@@ -155,6 +162,13 @@ def main(
 ) -> None:
     """Run one-shot symbol matching on a PDF drawing set."""
     user_bbox = _parse_bbox(bbox_raw)
+    parallel_cap = max_parallel_workers()
+    resolved_tile_workers = (
+        min(parallel_cap, tile_workers) if tile_workers > 0 else min(4, parallel_cap)
+    )
+    resolved_page_workers = (
+        min(parallel_cap, page_workers) if page_workers > 0 else min(2, parallel_cap)
+    )
     config = MatcherConfig(
         scales=_parse_scales(scales_raw),
         rotations_deg=_parse_rotations(rotations_raw),
@@ -165,6 +179,7 @@ def main(
         tile_size=sam3_tile,
         tile_overlap=sam3_overlap,
         skip_blank_tiles=not sam3_no_skip_blank,
+        tile_workers=resolved_tile_workers,
     )
 
     click.echo(f"Rendering {pdf_path.name} at {dpi} DPI (max {max_pages} pages)...")
@@ -282,6 +297,7 @@ def main(
         dino_rerank_config=dino_engine_cfg,
         dino_hf_token=hf_token,
         region_config=region_cfg,
+        page_workers=resolved_page_workers,
     )
 
     click.echo(f"Done. {len(hits)} match(es) across {len(export.searched_page_ids)} page(s).")

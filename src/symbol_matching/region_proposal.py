@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Protocol, Sequence, Tuple
 
+import cv2
 import numpy as np
-from PIL import Image
 
 from symbol_matching.models import BBox
 from symbol_matching.tiling import clamp_bbox_to_image, full_page_bbox
@@ -65,20 +65,45 @@ def default_region_onnx_path() -> Path:
 
 
 def preprocess_training_matched(page_rgb: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """Roboflow v6: grayscale, resize 640x640 stretch (not letterbox)."""
+    """Grayscale, resize 640x640 stretch (not letterbox).
+
+    Returns a single-channel ``(640, 640)`` uint8 image (not 3-channel RGB).
+    """
     page_h, page_w = page_rgb.shape[:2]
-    gray = np.asarray(Image.fromarray(page_rgb).convert("L"), dtype=np.uint8)
-    gray_pil = Image.fromarray(gray)
-    stretched = gray_pil.resize((TRAIN_IMGSZ, TRAIN_IMGSZ), Image.Resampling.BILINEAR)
-    infer_rgb = np.stack([np.asarray(stretched, dtype=np.uint8)] * 3, axis=-1)
+    gray = cv2.cvtColor(page_rgb, cv2.COLOR_RGB2GRAY)
+    stretched = cv2.resize(
+        gray, (TRAIN_IMGSZ, TRAIN_IMGSZ), interpolation=cv2.INTER_LINEAR
+    )
     scale_x = float(TRAIN_IMGSZ) / float(page_w)
     scale_y = float(TRAIN_IMGSZ) / float(page_h)
-    return infer_rgb, scale_x, scale_y
+    return stretched, scale_x, scale_y
+
+
+def gray640_to_nchw(gray: np.ndarray, out: np.ndarray) -> np.ndarray:
+    """Write normalized NCHW into ``out`` (shape ``(1, 3, 640, 640)``), reusing plane 0."""
+    if gray.shape != (TRAIN_IMGSZ, TRAIN_IMGSZ):
+        raise ValueError(f"expected gray {(TRAIN_IMGSZ, TRAIN_IMGSZ)}, got {gray.shape}")
+    if out.shape != (1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ):
+        raise ValueError(f"expected out {(1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ)}, got {out.shape}")
+    plane = out[0, 0]
+    np.multiply(gray, 1.0 / 255.0, out=plane, casting="unsafe")
+    out[0, 1][:] = plane
+    out[0, 2][:] = plane
+    return out
 
 
 def infer_rgb_to_nchw_float(infer_rgb: np.ndarray) -> np.ndarray:
-    chw = np.transpose(infer_rgb.astype(np.float32), (2, 0, 1)) / 255.0
-    return np.expand_dims(chw, axis=0)
+    """Pack grayscale or RGB uint8 into float NCHW ``(1, 3, H, W)``."""
+    if infer_rgb.ndim == 2:
+        buf = np.zeros((1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ), dtype=np.float32)
+        return gray640_to_nchw(infer_rgb, buf)
+    if infer_rgb.ndim != 3 or infer_rgb.shape[2] != 3:
+        raise ValueError(f"expected HxW or HxWx3 uint8, got shape {infer_rgb.shape}")
+    buf = np.zeros((1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ), dtype=np.float32)
+    np.divide(infer_rgb[:, :, 0], 255.0, out=buf[0, 0], casting="unsafe")
+    buf[0, 1][:] = buf[0, 0]
+    buf[0, 2][:] = buf[0, 0]
+    return buf
 
 
 def map_boxes_stretch_to_page(
@@ -152,7 +177,7 @@ def _parse_yolo_onnx_output(
     iou_threshold: float,
     max_detections: int,
 ) -> List[Tuple[float, float, float, float, float]]:
-    arr = np.asarray(output)
+    arr = np.asarray(output, dtype=np.float32)
     if arr.ndim == 3:
         # Ultralytics ONNX: (1, 4+nc, num_anchors) e.g. (1, 5, 8400).
         if arr.shape[2] >= 100 and arr.shape[1] < arr.shape[2]:
@@ -163,30 +188,51 @@ def _parse_yolo_onnx_output(
     else:
         raise ValueError(f"unexpected ONNX output shape: {arr.shape}")
 
-    boxes_xyxy: List[Tuple[float, float, float, float]] = []
-    scores: List[float] = []
-    for row in preds:
-        if row.shape[0] < 5:
-            continue
-        if row.shape[0] == 5:
-            cx, cy, bw, bh, score = float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])
-        else:
-            cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-            score = float(np.max(row[4:]))
-        if score < conf or bw <= 0.0 or bh <= 0.0:
-            continue
-        x1, y1, x2, y2 = _xywh_to_xyxy(cx, cy, bw, bh)
-        x1 = max(0.0, min(float(TRAIN_IMGSZ), x1))
-        y1 = max(0.0, min(float(TRAIN_IMGSZ), y1))
-        x2 = max(0.0, min(float(TRAIN_IMGSZ), x2))
-        y2 = max(0.0, min(float(TRAIN_IMGSZ), y2))
-        if x2 - x1 < 2.0 or y2 - y1 < 2.0:
-            continue
-        boxes_xyxy.append((x1, y1, x2, y2))
-        scores.append(score)
+    if preds.shape[1] < 5:
+        return []
 
-    keep = _nms_xyxy(boxes_xyxy, scores, iou_threshold)[:max_detections]
-    return [(boxes_xyxy[i][0], boxes_xyxy[i][1], boxes_xyxy[i][2], boxes_xyxy[i][3], scores[i]) for i in keep]
+    cx = preds[:, 0]
+    cy = preds[:, 1]
+    bw = preds[:, 2]
+    bh = preds[:, 3]
+    if preds.shape[1] == 5:
+        scores_arr = preds[:, 4]
+    else:
+        scores_arr = np.max(preds[:, 4:], axis=1)
+
+    valid = (scores_arr >= conf) & (bw > 0.0) & (bh > 0.0)
+    if not np.any(valid):
+        return []
+
+    cx = cx[valid]
+    cy = cy[valid]
+    bw = bw[valid]
+    bh = bh[valid]
+    scores_arr = scores_arr[valid]
+
+    half_w = bw * 0.5
+    half_h = bh * 0.5
+    x1 = np.clip(cx - half_w, 0.0, float(TRAIN_IMGSZ))
+    y1 = np.clip(cy - half_h, 0.0, float(TRAIN_IMGSZ))
+    x2 = np.clip(cx + half_w, 0.0, float(TRAIN_IMGSZ))
+    y2 = np.clip(cy + half_h, 0.0, float(TRAIN_IMGSZ))
+    size_ok = (x2 - x1 >= 2.0) & (y2 - y1 >= 2.0)
+    if not np.any(size_ok):
+        return []
+
+    x1 = x1[size_ok]
+    y1 = y1[size_ok]
+    x2 = x2[size_ok]
+    y2 = y2[size_ok]
+    scores_arr = scores_arr[size_ok]
+
+    boxes_xyxy = list(zip(x1.tolist(), y1.tolist(), x2.tolist(), y2.tolist()))
+    scores_list = scores_arr.tolist()
+    keep = _nms_xyxy(boxes_xyxy, scores_list, iou_threshold)[:max_detections]
+    return [
+        (boxes_xyxy[i][0], boxes_xyxy[i][1], boxes_xyxy[i][2], boxes_xyxy[i][3], scores_list[i])
+        for i in keep
+    ]
 
 
 def _preload_ort_cuda_dlls() -> None:
@@ -238,6 +284,9 @@ class OnnxRegionDetector:
         self._session = _create_ort_session(onnx_path, ort_device)
         self._input_name = self._session.get_inputs()[0].name
         self.active_providers: List[str] = list(self._session.get_providers())
+        self._input_nchw = np.zeros(
+            (1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ), dtype=np.float32
+        )
 
     def detect_640(
         self,
@@ -246,8 +295,17 @@ class OnnxRegionDetector:
         iou_threshold: float,
         max_detections: int,
     ) -> List[Tuple[float, float, float, float, float]]:
-        tensor = infer_rgb_to_nchw_float(infer_rgb)
-        outputs = self._session.run(None, {self._input_name: tensor})
+        if infer_rgb.ndim == 2:
+            gray640_to_nchw(infer_rgb, self._input_nchw)
+        elif infer_rgb.ndim == 3:
+            np.divide(
+                infer_rgb[:, :, 0], 255.0, out=self._input_nchw[0, 0], casting="unsafe"
+            )
+            self._input_nchw[0, 1][:] = self._input_nchw[0, 0]
+            self._input_nchw[0, 2][:] = self._input_nchw[0, 0]
+        else:
+            raise ValueError(f"expected HxW or HxWx3 uint8, got shape {infer_rgb.shape}")
+        outputs = self._session.run(None, {self._input_name: self._input_nchw})
         return _parse_yolo_onnx_output(outputs[0], conf, iou_threshold, max_detections)
 
 
@@ -300,9 +358,9 @@ def detect_drawing_regions_scored(
     detector: RegionDetector,
     config: RegionProposalConfig,
 ) -> List[Tuple[BBox, float]]:
-    infer_rgb, scale_x, scale_y = preprocess_training_matched(page_rgb)
+    gray640, scale_x, scale_y = preprocess_training_matched(page_rgb)
     raw = detector.detect_640(
-        infer_rgb,
+        gray640,
         config.conf,
         config.iou_threshold,
         config.max_detections,

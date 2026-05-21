@@ -34,15 +34,38 @@ def resolve_hf_token(explicit_token: Optional[str]) -> Optional[str]:
     return None
 
 
+def release_sam3_bundle() -> None:
+    """Unload the cached SAM3 model and free GPU memory if possible."""
+    global _hf_bundle, _hf_bundle_key
+    if _hf_bundle is None:
+        return
+    import gc
+
+    model, processor = _hf_bundle
+    del model, processor
+    _hf_bundle = None
+    _hf_bundle_key = None
+    gc.collect()
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def load_sam3_bundle(model_id: str, token: Optional[str]) -> tuple:
     """Load and cache (model, processor) for ``model_id``.
 
     Subsequent calls with the same key return the cached bundle.
+    Releases any cached DINOv3 bundle first so only one large HF model owns the GPU.
     """
     global _hf_bundle, _hf_bundle_key
     key = f"{model_id}\0{token or ''}"
     if _hf_bundle is not None and _hf_bundle_key == key:
         return _hf_bundle
+
+    from symbol_matching.dinov3_rerank import release_dinov3_bundle
+
+    release_dinov3_bundle()
 
     import torch  # noqa: WPS433 (lazy import is intentional)
     from transformers import Sam3Model, Sam3Processor

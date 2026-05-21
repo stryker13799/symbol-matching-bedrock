@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image
 
 from symbol_matching.models import BBox, MatchHit
-from symbol_matching.viz import crop_rgb
+from symbol_matching.viz import crop_rgb_owned
 
 DEFAULT_DINOV3_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
@@ -35,12 +35,37 @@ def resolve_hf_token(explicit_token: Optional[str]) -> Optional[str]:
     return None
 
 
+def release_dinov3_bundle() -> None:
+    """Unload the cached DINOv3 model and free GPU memory if possible."""
+    global _bundle, _bundle_key
+    if _bundle is None:
+        return
+    import gc
+
+    model, processor = _bundle
+    del model, processor
+    _bundle = None
+    _bundle_key = None
+    gc.collect()
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def load_dinov3_bundle(model_id: str, token: Optional[str]) -> Tuple[object, object]:
-    """Load and cache ``(model, processor)``."""
+    """Load and cache ``(model, processor)``.
+
+    Releases any cached SAM3 bundle first so only one large HF model owns the GPU.
+    """
     global _bundle, _bundle_key
     key = f"{model_id}\0{token or ''}"
     if _bundle is not None and _bundle_key == key:
         return _bundle
+
+    from symbol_matching.sam3 import release_sam3_bundle
+
+    release_sam3_bundle()
 
     import torch
     from transformers import AutoImageProcessor, AutoModel
@@ -129,7 +154,7 @@ def rerank_template_hits_on_page(
     valid: List[MatchHit] = []
     for h in template_hits:
         try:
-            c = crop_rgb(page_rgb, h.bbox)
+            c = crop_rgb_owned(page_rgb, h.bbox)
         except ValueError:
             continue
         if c.size == 0:
@@ -140,28 +165,32 @@ def rerank_template_hits_on_page(
     if len(crops) == 0:
         return []
 
-    all_sims: List[float] = []
+    all_sims = np.empty(len(crops), dtype=np.float32)
     bs = max(1, int(config.batch_size))
+    offset = 0
     for start in range(0, len(crops), bs):
         chunk = crops[start : start + bs]
         emb = _embed_batch(chunk, model, processor, config.use_fp16)
         sims = np.dot(emb, exemplar_emb)
-        all_sims.extend(float(s) for s in sims.tolist())
+        n = int(sims.shape[0])
+        all_sims[offset : offset + n] = sims
+        offset += n
 
     out: List[MatchHit] = []
     for h, sim in zip(valid, all_sims):
-        if sim < config.min_cosine:
+        sim_f = float(sim)
+        if sim_f < config.min_cosine:
             continue
         t_score = float(h.score)
         out.append(
             MatchHit(
                 page_id=h.page_id,
                 bbox=h.bbox,
-                score=float(sim),
+                score=sim_f,
                 source=f"template+dino:{h.source}",
                 crop_path=h.crop_path,
                 template_score=t_score,
-                dino_cosine=float(sim),
+                dino_cosine=sim_f,
             )
         )
     out.sort(key=lambda x: -x.score)
