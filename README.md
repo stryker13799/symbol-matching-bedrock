@@ -10,14 +10,12 @@ matching instance across a scoped subset of pages and export results.
 
 - **Input:** one or more drawing pages from a PDF (default sample in `Sample_Input/`).
 - **Reference:** a user-drawn axis-aligned box around the symbol (CLI: `--bbox` in rendered pixel coordinates; Streamlit: rectangle on the zoom canvas).
-- **Pipeline:** render → optional SAM 3 bbox refine on the reference page → match across a **scoped** page subset → JSON + per-hit crops + per-page overlay PNGs.
+- **Pipeline:** render → optional drawing-region ONNX ROI → match across a **scoped** page subset → JSON + per-hit crops + per-page overlay PNGs.
 - **Per-page metadata:** sheet reference, page name, coarse `page_type`, and `plan_family` (for scope rules), inferred from PDF text + title-block heuristics (PyMuPDF).
 - **Scopes** (as in the brief): `this_page`, `similar_page_name` (same `plan_family`), `same_page_type`, `all_pages`.
 - **Engines** (CLI `--engine` / Streamlit):
-  - **`template`** — OpenCV binary template matching on ink masks (CPU, default).
-  - **`template+dino`** — template matching **only proposes** candidates (`--min-score` on template correlation); [DINOv3 ViT-S/16](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m) cosine vs the exemplar **filters, ranks, and scores** hits (`--dino-min-cosine`); exported `score` and overlay coloring follow **DINO cosine**; `template_score` is diagnostic.
-  - **`sam3`** — experimental composite-and-tile cross-page matcher using `facebook/sam3` (GPU + fp16; slowest).
-- **Optional SAM 3 refinement:** on the **reference page only**, tightens the user box to a segmentation bbox before building templates (gated HF model).
+  - **`template`** — OpenCV binary template matching on ink masks (CPU).
+  - **`template+dino`** (default) — template matching **only proposes** candidates (`--min-score` on template correlation); [DINOv3 ViT-S/16](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m) **ONNX** cosine vs the exemplar **filters, ranks, and scores** hits (`--dino-min-cosine`); exported `score` and overlay coloring follow **DINO cosine**; `template_score` is diagnostic.
 
 ---
 
@@ -28,8 +26,6 @@ matching instance across a scoped subset of pages and export results.
 **Primary:** classical **template matching** over binarized “ink” masks. Construction symbols are often high-contrast line art at consistent sheet scale — a regime where normalized cross-correlation is fast, deterministic, and easy to tune.
 
 **Optional second stage (`template+dino`):** keep template matching for **high recall proposals**, then drop obvious false positives with an **embedding cosine** to the user exemplar. That mirrors a common production pattern: cheap proposal generator + semantic filter.
-
-**Experimental (`sam3`):** explores SAM 3 as an end-to-end matcher via tiling; useful as a research direction, not positioned as the default path for speed or simplicity.
 
 **Not in scope for this POC:** trained object detectors, full legend-to-symbol-ID automation, or quantity takeoff reporting (see **MVP scope** below).
 
@@ -43,18 +39,17 @@ matching instance across a scoped subset of pages and export results.
 | CLI | Click |
 | Config / export schema | Pydantic v2 |
 | Optional UI | Streamlit + `streamlit-drawable-canvas` |
-| SAM 3 (refine + engine) | Hugging Face `transformers` + `torch` + `accelerate`, model `facebook/sam3` (**gated** — token required) |
-| DINOv3 rerank | `transformers` + `torch`, `facebook/dinov3-vits16-pretrain-lvd1689m` (**gated** LVD weights — token required) |
+| Drawing-region + DINOv3 inference | **ONNX Runtime GPU** (`onnxruntime-gpu`, CUDA EP) |
+| DINOv3 export (one-time) | `torch` + `transformers` via optional `[export]` extra; gated HF weights for `facebook/dinov3-vits16-pretrain-lvd1689m` |
 
-No paid cloud APIs; everything runs locally once dependencies and HF access are configured.
+No paid cloud APIs; runtime inference uses local ONNX weights only (after export).
 
 ### 3. How the boxed reference region is used
 
 1. **Crop** the rectangle from the rendered reference page (page index is explicit in CLI/UI).
-2. **Optional:** SAM 3 segmentation on that page only → replace loose user box with a tighter mask bbox.
-3. **Binarize** the crop (adaptive threshold) → ink mask; **trim** to tight ink bounds with small padding.
-4. **Template bank:** one mask per combination of configured **rotations** (default `0/90/180/270`) and **scales** (default `0.85 … 1.18`); scales and rotations are user-tunable.
-5. For **`template` / `template+dino`:** each bank variant is slid over each target page’s ink mask **inside the search ROI**, using the same **tile grid + near-blank tile skip** as SAM3 (defaults: 768 px tiles, 192 px overlap). For **`sam3`:** exemplar and page tiles are fed through the SAM 3 image pipeline inside the ROI.
+2. **Binarize** the crop (adaptive threshold) → ink mask; **trim** to tight ink bounds with small padding.
+3. **Template bank:** one mask per combination of configured **rotations** (default `0/90/180/270`) and **scales** (default `0.85 … 1.18`); scales and rotations are user-tunable.
+4. Each bank variant is slid over each target page’s ink mask **inside the search ROI**, using a **tile grid + near-blank tile skip** (defaults: 768 px tiles, 192 px overlap).
 
 ### 4. How we search across pages
 
@@ -76,17 +71,12 @@ No paid cloud APIs; everything runs locally once dependencies and HF access are 
 - Discard crops with cosine to the exemplar embedding below `--dino-min-cosine`.
 - **Sort and color by DINO cosine** (`score` in JSON and overlays); template correlation is retained as `template_score` for debugging only.
 
-**`sam3` engine:**
-
-- Uses the SAM 3 model’s own detection scores and thresholds (`--sam3-score`) plus NMS / caps as configured in `sam3_engine`.
-
 ### 6. Tradeoffs vs other approaches
 
 | Approach | Pros | Cons |
 |----------|------|------|
 | Binary template (baseline) | Fast CPU, explainable, no training | Weak to non-cardinal rotation, line-weight drift, broken geometry |
-| Template + embedding rerank | Better precision on ambiguous repeats | Needs GPU for comfortable latency; still needs proposals |
-| SAM 3 PCS | Strong segmentation / promptability | Gated model, GPU-heavy; engine path is experimental in this repo |
+| Template + embedding rerank (ONNX) | Better precision on ambiguous repeats | One-time ONNX export; GPU for comfortable latency |
 | Trained detector / learned metric | Best long-term accuracy | Needs labeled data and retrain loop |
 
 ### 7. Rotated or scaled symbols
@@ -110,11 +100,9 @@ Per the brief, **false negatives are more costly than false positives** for this
 - **Cap rendered pages** (`--max-pages`) for interactive demos.
 - **Downscale before match** (`--max-search-side`): longest side of the work image is clamped; template scales compensate.
 - **Cap candidates per variant** and **max hits per page** to bound worst-case work.
-- **`template+dino`:** batch DINO forwards (`--dino-batch`); fp16 on CUDA (`--dino-fp16`).
-- **`sam3`:** tile the page, composite with exemplar, optional skip of near-blank tiles, batching, and `--sam3-max-page-side` to reduce tile count.
-- **Drawing-region ONNX (optional, all engines):** with `--yolo-regions` (CLI default **on**), ONNX (`src/drawing_region_yolo_model/weights.onnx`) proposes the plan area per page. **All engines** search inside the merged ROI and **skip near-blank tiles** there. Writes **`region_overlays/{page_id}_regions.png`** (green = detections, cyan = search ROI). Uses **ONNX Runtime GPU** (`onnxruntime-gpu`, CUDA EP). Region ONNX runs once per page in the main process; the session is dropped after each run.
-- **CPU parallelism (`template` / `template+dino` proposal stage):** optional **tile workers** (parallel OpenCV passes per page) and **page workers** (parallel pages). Pools are capped at **`cpu_count() − 4`** (minimum 1). **Page workers > 1 disables tile workers** (no nested pools). See **§9a**.
-- **GPU memory (SAM3 vs DINO):** only one large vision model stays on GPU at a time; caches are cleared at the end of each run. See **§9b**.
+- **`template+dino`:** batched DINOv3 ONNX forwards (`--dino-batch`) on GPU via `--dino-ort-device cuda`.
+- **Drawing-region ONNX (default on):** with `--yolo-regions`, ONNX (`src/drawing_region_yolo_model/weights.onnx`) proposes the plan area per page. Search runs inside the merged ROI with **near-blank tile skip**. Writes **`region_overlays/{page_id}_regions.png`**. Both region and DINO models use **ONNX Runtime GPU** (CUDA EP).
+- **CPU parallelism (template proposal stage):** optional **tile workers** and **page workers**. Pools are capped at **`cpu_count() − 4`** (minimum 1). **Page workers > 1 disables tile workers** (no nested pools). See **§9a**.
 
 A production system would add **persistent render caches**, **async workers**, and (for embedding search) **precomputed page embeddings** keyed by drawing revision.
 
@@ -127,16 +115,9 @@ A production system would add **persistent render caches**, **async workers**, a
 
 **CLI defaults when flags are `0`:** tile workers = `min(4, cpu_count − 4)`, page workers = `min(2, cpu_count − 4)`.
 
-**Not parallel:** `sam3` engine (`page_workers > 1` errors); DINO rerank after proposals; YOLO region inference; export I/O.
+**Not parallel:** DINOv3 ONNX rerank after proposals; YOLO region inference; export I/O.
 
-**GPU vs CPU:** template matching is **CPU-only** (OpenCV). GPU helps **region ONNX**, **DINO**, and **SAM3**.
-
-### 9b. GPU memory (SAM3 vs DINO)
-
-- Loading **SAM3** releases cached **DINOv3**; loading **DINO** releases cached **SAM3**.
-- **Start** of each `run_matching`: drop bundles not needed for the selected `--engine`.
-- **End** of each run: clear all SAM3/DINO caches and call `torch.cuda.empty_cache()` (next run reloads weights).
-- **SAM3 exemplar refine** (optional): SAM3 is released before matching when the main engine is `template` or `template+dino`.
+**GPU vs CPU:** template matching is **CPU-only** (OpenCV). GPU runs **region ONNX** and **DINOv3 ONNX** via onnxruntime-gpu.
 
 ### 10. Data stored for each matched result
 
@@ -153,7 +134,7 @@ For **`template+dino`**, `score` is **DINO cosine**; `template_score` and `dino_
 1. Deterministic **template** path end-to-end (prove value on clean symbols).
 2. **Scope + metadata** so “which pages to search” matches the spec.
 3. **Exports** (JSON + crops + overlays) for review.
-4. **Optional** `template+dino` and SAM 3 paths as extensions
+4. **`template+dino`** with ONNX DINOv3 rerank for production-style inference
 
 ### 12. MVP scope — what this skips
 
@@ -161,8 +142,6 @@ For **`template+dino`**, `score` is **DINO cosine**; `template_score` and `dino_
 - No **full-sheet OCR** for symbol names; metadata is heuristics on **vector text**.
 - No **automatic legend row alignment** or symbol **taxonomy / quantity takeoff** in code
 - No **deployed** hosted demo in this repo (optional per brief).
-- **SAM 3 “refine”** is reference-page-only by design (HF processor is single-image).
-
 ### 13. How this would change for production
 
 - **Data:** store drawing set id, revision, page render hash, exemplar version, and reviewer labels per hit.
@@ -176,7 +155,7 @@ For **`template+dino`**, `score` is **DINO cosine**; `template_score` and `dino_
 PDF upload → render workers (PyMuPDF) ──► object storage (page PNGs / thumbnails)
                                       └─► metadata index (sheet_ref, page_type, plan_family)
 
-User box + scope → match workers (template / template+dino / SAM3)
+User box + scope → match workers (template / template+dino ONNX)
                  └─► hits DB + crop storage + overlay cache
 
 Review UI → feedback store → threshold tuning + training export
@@ -220,18 +199,16 @@ Optional extras:
 
 ```powershell
 uv pip install -e ".[dev,ui]"       # Streamlit UI
-uv pip install -e ".[dev,sam3]"    # torch + transformers + accelerate (SAM3)
-uv pip install -e ".[dev,dino]"    # torch + transformers (DINOv3; overlaps sam3 deps)
-uv pip install -e ".[dev,region]"  # onnxruntime-gpu for drawing-region proposals
+uv pip install -e ".[dev,export]"   # one-time ONNX export (torch, transformers, onnx)
 ```
 
-Export region ONNX once from the bundled `.pt` (requires `export-region` extra / ultralytics):
+Export DINOv3 ONNX once (requires `[export]` extra; gated weights need **`HF_TOKEN`** in the environment or repo-root **`.env`**):
 
 ```powershell
-python scripts/export_region_onnx.py
+python scripts/export_dino_onnx.py
 ```
 
-Set **`HF_TOKEN`** or **`HUGGING_FACE_HUB_TOKEN`** for gated Hugging Face models (SAM 3, DINOv3 LVD weights).
+Writes `src/dinov3_weights/dinov3_vits16.onnx`. Override output with `--output`. Set **`DINOV3_ONNX`** at runtime to use a different path.
 
 ---
 
@@ -262,21 +239,16 @@ Notable flags:
 | `--page-workers` | `0` → `min(2, CPU−4)` | Template page process pool; `>1` disables tile workers |
 | `--scales` | `0.85,0.92,1.0,1.08,1.18` | Multi-scale bank |
 | `--rotations` | `rot4` | `rot4`, `0`, or comma-separated degrees |
-| `--engine` | `template+dino` | `template`, `template+dino`, or `sam3` |
-| `--use-sam3-refine` | off | Tighten exemplar bbox on reference page with SAM3 |
-| `--dino-model` | `facebook/dinov3-vits16-pretrain-lvd1689m` | Weights for `template+dino` |
+| `--engine` | `template+dino` | `template` or `template+dino` |
+| `--dino-onnx` | `src/dinov3_weights/dinov3_vits16.onnx` | DINOv3 ONNX path |
+| `--dino-ort-device` | `cuda` | ONNX Runtime EP for DINOv3: `cuda` or `cpu` |
 | `--dino-min-cosine` | `0.55` | Minimum exemplar–crop cosine to keep a hit |
-| `--dino-batch` | `32` | Crops per DINO forward |
-| `--dino-fp16` / `--dino-fp32` | fp16 | Mixed precision on CUDA |
-| `--sam3-score` | `0.4` | SAM3 score threshold (refine + engine) |
-| `--sam3-max-page-side` | `3200` | Cap longest page side (work pixels) before SAM3 tiling; `0` = native (slow) |
-| `--sam3-batch` | `8` | Composites per SAM3 forward |
-| `--sam3-no-skip-blank` | off | Disable fast skip of near-white tiles |
+| `--dino-batch` | `32` | Crops per DINOv3 ONNX forward |
 | `--yolo-regions` / `--no-yolo-regions` | **on** | Restrict search to ONNX drawing-region ROI per page |
 | `--yolo-onnx` | bundled `weights.onnx` | Region detector ONNX path |
 | `--yolo-conf` | `0.25` | Region detection confidence |
 | `--yolo-padding-frac` | `0.02` | Pad merged drawing ROI (fraction of page size) |
-| `--yolo-ort-device` | `cuda` | ONNX Runtime EP: `cuda` or `cpu` |
+| `--yolo-ort-device` | `cuda` | ONNX Runtime EP for region model: `cuda` or `cpu` |
 
 Example (multi-page template + parallelism):
 
@@ -303,9 +275,7 @@ streamlit run app.py
 
 Upload a PDF (or rely on the sample in `Sample_Input/`), pick reference page, draw a rectangle on the zoomed canvas, choose scope and engine, run. Results: table (sorted by `score`), downloadable JSON, per-page overlay images, and a simple hit explorer.
 
-For **`template`** or **`template+dino`**, the sidebar includes **Tile workers** and **Page workers** (max = CPU count − 4). Use page workers for multi-sheet scopes; tile workers for one large page. **SAM3** does not use this CPU pool.
-
-Switching engines in one Streamlit session releases the previous engine’s GPU weights after each run (see **§9b**).
+For **`template`** or **`template+dino`**, the sidebar includes **Tile workers** and **Page workers** (max = CPU count − 4). Use page workers for multi-sheet scopes; tile workers for one large page. DINOv3 and region models use ONNX Runtime on the selected CUDA/CPU device.
 
 ---
 

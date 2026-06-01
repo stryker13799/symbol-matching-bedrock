@@ -1,4 +1,4 @@
-"""Orchestrator: render PDF, refine exemplar, match, export."""
+"""Orchestrator: render PDF, match, export."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from symbol_matching.models import (
     RunExport,
 )
 from symbol_matching.pdf import RenderedPage
-from symbol_matching.gpu_memory import release_all_gpu_bundles, release_gpu_bundles_except
 from symbol_matching.region_proposal import (
     RegionProposalConfig,
     load_region_model,
@@ -42,8 +41,7 @@ from symbol_matching.viz import (
 
 ENGINE_TEMPLATE = "template"
 ENGINE_TEMPLATE_DINO = "template+dino"
-ENGINE_SAM3 = "sam3"
-ALL_ENGINES = (ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO, ENGINE_SAM3)
+ALL_ENGINES = (ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO)
 
 
 @dataclass(frozen=True)
@@ -178,36 +176,18 @@ def run_matching(
     scope_label: str,
     refined_bbox: Optional[BBox] = None,
     engine: str = ENGINE_TEMPLATE,
-    sam3_engine_config: Optional[object] = None,
-    sam3_model_id: str = "facebook/sam3",
-    sam3_hf_token: Optional[str] = None,
     dino_rerank_config: Optional[object] = None,
-    dino_hf_token: Optional[str] = None,
     region_config: Optional[RegionProposalConfig] = None,
     progress_cb: Optional[callable] = None,
     page_workers: int = 1,
 ) -> Tuple[List[MatchHit], RunExport, RunArtifacts]:
     """Run end-to-end matching and write JSON + crops + annotated overlays.
 
-    ``engine`` selects the matcher: ``template`` (OpenCV only), ``template+dino``
-    (template proposals then DINOv3 cosine filter; hit ``score`` is DINO cosine),
-    or ``sam3`` (composite-tile SAM 3). For ``sam3`` pass ``sam3_engine_config``;
-    for ``template+dino`` pass ``dino_rerank_config``.
+    ``engine`` is ``template`` (OpenCV only) or ``template+dino`` (template proposals
+    then DINOv3 ONNX cosine filter). For ``template+dino`` pass ``dino_rerank_config``.
     """
     if engine not in ALL_ENGINES:
         raise ValueError(f"unsupported engine: {engine}; choose from {ALL_ENGINES}")
-    if page_workers > 1 and engine == ENGINE_SAM3:
-        raise ValueError(
-            "page_workers > 1 is not supported for engine sam3 (single GPU model); "
-            "use page_workers=1 or engine template / template+dino"
-        )
-
-    if engine == ENGINE_TEMPLATE:
-        release_gpu_bundles_except(None)
-    elif engine == ENGINE_TEMPLATE_DINO:
-        release_gpu_bundles_except("dino")
-    elif engine == ENGINE_SAM3:
-        release_gpu_bundles_except("sam3")
 
     tile_workers, effective_page_workers = resolve_parallel_workers(
         matcher_config.tile_workers, page_workers
@@ -274,6 +254,14 @@ def run_matching(
         overlay = draw_region_proposals_on_page(page_rgb, scored, search_rois)
         save_png(overlay, region_overlays_dir / f"{page.id}_regions.png")
 
+    dino_embedder: Optional[object] = None
+    if engine == ENGINE_TEMPLATE_DINO:
+        from symbol_matching.dinov3_rerank import DinoRerankConfig, load_dinov3_embedder
+
+        d_cfg = dino_rerank_config if dino_rerank_config is not None else DinoRerankConfig()
+        dino_embedder = load_dinov3_embedder(d_cfg.onnx_path, d_cfg.ort_device)
+        model_path = f"opencv:matchTemplate+onnx-dinov3:cosine-rerank{model_path_suffix}"
+
     if engine == ENGINE_TEMPLATE:
         template_bank = build_template_bank(exemplar_crop, match_cfg)
         model_path = f"opencv:matchTemplate:binary-ink{model_path_suffix}"
@@ -301,16 +289,10 @@ def run_matching(
             all_hits.extend(page_hits)
             enriched.extend(page_enriched)
     elif engine == ENGINE_TEMPLATE_DINO:
-        from symbol_matching.dinov3_rerank import (
-            DinoRerankConfig,
-            load_dinov3_bundle,
-            rerank_template_hits_on_page,
-        )
+        from symbol_matching.dinov3_rerank import DinoRerankConfig, rerank_template_hits_on_page
 
         template_bank = build_template_bank(exemplar_crop, match_cfg)
         d_cfg = dino_rerank_config if dino_rerank_config is not None else DinoRerankConfig()
-        dino_model, dino_processor = load_dinov3_bundle(d_cfg.model_id, dino_hf_token)
-        model_path = f"opencv:matchTemplate+{d_cfg.model_id}:cosine-rerank{model_path_suffix}"
         dino_page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]] = []
         for page in searched_pages:
             if page.id not in page_index:
@@ -337,8 +319,7 @@ def run_matching(
                 page_rgb,
                 exemplar_crop,
                 raw_template,
-                dino_model,
-                dino_processor,
+                dino_embedder,
                 d_cfg,
             )
             raw_reranked = raw_reranked[: match_cfg.max_hits_per_page]
@@ -347,60 +328,13 @@ def run_matching(
             )
             all_hits.extend(page_hits)
             enriched.extend(page_enriched)
-    elif engine == ENGINE_SAM3:
-        from symbol_matching.sam3_engine import (
-            Sam3EngineConfig,
-            load_sam3_engine,
-            match_exemplar_on_page_with_sam3,
-        )
-
-        if sam3_engine_config is None:
-            sam3_engine_config = Sam3EngineConfig()
-        model, processor = load_sam3_engine(sam3_model_id, sam3_hf_token)
-        model_path = (
-            f"huggingface:{sam3_model_id}:composite-tile"
-            f"+fp16={sam3_engine_config.use_fp16}{model_path_suffix}"
-        )
-        for page in searched_pages:
-            if page.id not in page_index:
-                continue
-            page_rgb = page_index[page.id].image_rgb
-            _save_region_overlay(page, page_rgb)
-            _, search_rois = _page_regions(page.id, page_rgb)
-            if progress_cb is not None:
-                progress_cb(
-                    f"sam3: page {page.id} ({page.sheet_ref}) — "
-                    f"work_side≤{sam3_engine_config.max_page_infer_side}, "
-                    f"batch={sam3_engine_config.batch_size}"
-                    f"{', ONNX ROI' if r_cfg.enabled else ''}"
-                )
-            raw_hits = match_exemplar_on_page_with_sam3(
-                page_rgb=page_rgb,
-                exemplar_rgb=exemplar_crop,
-                config=sam3_engine_config,
-                model=model,
-                processor=processor,
-                search_rois=search_rois,
-                progress_cb=(
-                    (
-                        lambda b_done, b_total, n_tiles, pid=page.id: progress_cb(
-                            f"  {pid}: SAM3 batch {b_done}/{b_total} ({n_tiles} non-blank tiles)"
-                        )
-                    )
-                    if progress_cb is not None else None
-                ),
-            )
-            page_hits, page_enriched = _persist_page_hits(
-                page, page_rgb, raw_hits, crops_dir, overlays_dir
-            )
-            all_hits.extend(page_hits)
-            enriched.extend(page_enriched)
     else:
         raise ValueError(f"unsupported engine: {engine}")
 
     if region_detector is not None:
         del region_detector
-    release_all_gpu_bundles()
+    if dino_embedder is not None:
+        del dino_embedder
 
     export = RunExport(
         reference_page_id=ref_page.record.id,

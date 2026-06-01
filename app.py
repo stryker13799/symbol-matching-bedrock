@@ -7,13 +7,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import streamlit as st
+
+st.set_page_config(page_title="Symbol Matching POC", layout="wide")
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
 from symbol_matching.matcher import MatcherConfig, max_parallel_workers
 from symbol_matching.models import BBox, MatchHit, PageRecord
 from symbol_matching.pdf import RenderedPage, render_pdf
-from symbol_matching.pipeline import ENGINE_SAM3, ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO, run_matching
+from symbol_matching.pipeline import ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO, run_matching
 from symbol_matching.scope import (
     SCOPE_ALL_PAGES,
     SCOPE_PAGE_TYPE,
@@ -39,8 +41,7 @@ _SCOPE_LABELS = {
 
 _ENGINE_LABELS = {
     ENGINE_TEMPLATE: "Template (OpenCV, fast)",
-    ENGINE_TEMPLATE_DINO: "Template + DINOv3 rerank",
-    ENGINE_SAM3: "SAM3 composite-tile",
+    ENGINE_TEMPLATE_DINO: "Template + DINOv3 ONNX rerank",
 }
 
 
@@ -252,7 +253,6 @@ def _show_results(state: Dict[str, Any], page_records: List[PageRecord]) -> None
 
 
 def main() -> None:
-    st.set_page_config(page_title="Symbol Matching POC", layout="wide")
     st.title("Symbol Matching POC")
 
     with st.sidebar:
@@ -270,13 +270,12 @@ def main() -> None:
         )
         engine = st.selectbox(
             "Engine",
-            options=[ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO, ENGINE_SAM3],
-            index=0,
+            options=[ENGINE_TEMPLATE, ENGINE_TEMPLATE_DINO],
+            index=1,
             format_func=lambda e: _ENGINE_LABELS[e],
             help=(
                 "Template is fastest. Template+DINO: template threshold proposes boxes; "
-                "DINO cosine is the reported score, overlays, and table sort (GPU). "
-                "SAM3 is slowest."
+                "DINOv3 ONNX cosine is the reported score, overlays, and table sort (GPU)."
             ),
         )
         nms_iou = float(st.slider("NMS IoU", 0.1, 0.9, 0.30, 0.05))
@@ -285,12 +284,13 @@ def main() -> None:
         st.header("Drawing region (YOLO)")
         use_yolo_regions = st.checkbox(
             "Limit search to YOLO drawing region (ONNX)",
-            value=False,
+            value=True,
             help="Lightweight ONNX region detector per page (training-matched preprocess). "
-            "Search runs inside the merged ROI; SAM3 still skips near-blank tiles there.",
+            "Search runs inside the merged ROI.",
         )
         yolo_conf = float(st.slider("YOLO region conf", 0.10, 0.90, 0.25, 0.05))
         yolo_ort_device = st.selectbox("Region ONNX device", ["cuda", "cpu"], index=0)
+        dino_ort_device = st.selectbox("DINOv3 ONNX device", ["cuda", "cpu"], index=0)
 
         st.header("Search tiling (all engines)")
         search_tile = int(st.number_input("Tile size (work px)", 256, 1500, 768, 32))
@@ -350,29 +350,6 @@ def main() -> None:
             scale_steps = int(st.number_input("Scale steps", min_value=1, max_value=9, value=5))
             dino_min_cosine = float(st.slider("DINO min cosine", 0.30, 0.95, 0.55, 0.01))
             dino_batch = int(st.number_input("DINO batch size", 4, 128, 32, 4))
-            dino_fp16 = st.checkbox("DINO fp16 on CUDA", value=True)
-        else:
-            min_score = float(st.slider("SAM3 score threshold", 0.20, 0.90, 0.40, 0.01))
-            sam3_exemplar_side = int(st.number_input("SAM3 exemplar max side", 80, 400, 200, 10))
-            sam3_fp16 = st.checkbox("Use fp16 on CUDA", value=True)
-            sam3_max_page_side = int(
-                st.number_input(
-                    "SAM3 max page side (work px, 0=native, slow)",
-                    min_value=0,
-                    max_value=8192,
-                    value=3200,
-                    step=128,
-                    help="Downscale page+exemplar before tiling. Lower = fewer tiles, faster.",
-                )
-            )
-            sam3_batch = int(st.number_input("SAM3 batch size", 1, 16, 8, 1))
-            use_rot4 = True
-            scale_min, scale_max, scale_steps = 0.85, 1.18, 5
-
-        st.header("Optional SAM3 box refine")
-        use_sam3 = st.checkbox(
-            "Snap exemplar bbox using SAM3 (reference page only)", value=False
-        )
 
     # --- Load PDF ---
     pdf_bytes: Optional[bytes] = None
@@ -541,23 +518,6 @@ def main() -> None:
         tile_workers=template_tile_workers,
     )
 
-    refined_bbox: Optional[BBox] = None
-    if use_sam3:
-        from symbol_matching.sam3 import refine_exemplar_bbox
-
-        with st.spinner("Refining exemplar with SAM3..."):
-            refined_bbox = refine_exemplar_bbox(
-                page_rgb,
-                user_bbox,
-                model_id="facebook/sam3",
-                hf_token=None,
-                score_threshold=0.5,
-            )
-        if engine != ENGINE_SAM3:
-            from symbol_matching.sam3 import release_sam3_bundle
-
-            release_sam3_bundle()
-
     out_dir = _PROJECT_ROOT / "exports" / "streamlit_run"
 
     from symbol_matching.region_proposal import (
@@ -572,31 +532,15 @@ def main() -> None:
         ort_device=yolo_ort_device,
     )
 
-    sam3_engine_cfg = None
     dino_engine_cfg = None
     if engine == ENGINE_TEMPLATE_DINO:
-        from symbol_matching.dinov3_rerank import DinoRerankConfig
+        from symbol_matching.dinov3_rerank import DinoRerankConfig, default_dino_onnx_path
 
         dino_engine_cfg = DinoRerankConfig(
+            onnx_path=default_dino_onnx_path(),
+            ort_device=dino_ort_device,
             batch_size=dino_batch,
             min_cosine=dino_min_cosine,
-            use_fp16=dino_fp16,
-        )
-    if engine == ENGINE_SAM3:
-        from symbol_matching.sam3_engine import Sam3EngineConfig
-
-        sam3_engine_cfg = Sam3EngineConfig(
-            tile_size=search_tile,
-            tile_overlap=search_overlap,
-            composite_size=1008,
-            exemplar_max_side=sam3_exemplar_side,
-            score_threshold=min_score,
-            nms_iou=nms_iou,
-            max_hits_per_page=max_hits,
-            use_fp16=sam3_fp16,
-            batch_size=sam3_batch,
-            max_page_infer_side=sam3_max_page_side,
-            skip_blank_tiles=search_skip_blank,
         )
 
     spinner_label = f"Matching across {len(searched)} page(s) with engine '{engine}'..."
@@ -609,9 +553,7 @@ def main() -> None:
             matcher_config=config,
             output_dir=out_dir,
             scope_label=scope_value,
-            refined_bbox=refined_bbox,
             engine=engine,
-            sam3_engine_config=sam3_engine_cfg,
             dino_rerank_config=dino_engine_cfg,
             region_config=region_cfg,
             page_workers=template_page_workers,
@@ -625,5 +567,4 @@ def main() -> None:
     _show_results(st.session_state, page_records)
 
 
-if __name__ == "__main__":
-    main()
+main()

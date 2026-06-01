@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Protocol, Sequence, Tuple
@@ -12,6 +11,7 @@ import cv2
 import numpy as np
 
 from symbol_matching.models import BBox
+from symbol_matching.ort_session import create_ort_session
 from symbol_matching.tiling import clamp_bbox_to_image, full_page_bbox
 
 TRAIN_IMGSZ = 640
@@ -235,45 +235,6 @@ def _parse_yolo_onnx_output(
     ]
 
 
-def _preload_ort_cuda_dlls() -> None:
-    """Load CUDA/cuDNN DLLs on Windows before creating a CUDA ORT session."""
-    if sys.platform != "win32":
-        return
-    import onnxruntime as ort
-
-    preload = getattr(ort, "preload_dlls", None)
-    if preload is not None:
-        preload()
-
-
-def _ort_session_providers(ort_device: str) -> List[str | Tuple[str, dict]]:
-    import onnxruntime as ort
-
-    available = set(ort.get_available_providers())
-    device = ort_device.strip().lower()
-    if device in ("cuda", "gpu", "0"):
-        if "CUDAExecutionProvider" not in available:
-            raise RuntimeError(
-                "CUDAExecutionProvider is not available. "
-                "Install onnxruntime-gpu: uv pip install onnxruntime-gpu"
-            )
-        _preload_ort_cuda_dlls()
-        return [
-            ("CUDAExecutionProvider", {"device_id": 0}),
-            "CPUExecutionProvider",
-        ]
-    if device == "cpu":
-        return ["CPUExecutionProvider"]
-    raise ValueError(f"unsupported ort_device: {ort_device!r}; use 'cuda' or 'cpu'")
-
-
-def _create_ort_session(onnx_path: Path, ort_device: str) -> object:
-    import onnxruntime as ort
-
-    providers = _ort_session_providers(ort_device)
-    return ort.InferenceSession(str(onnx_path), providers=providers)
-
-
 class OnnxRegionDetector:
     def __init__(self, onnx_path: Path, ort_device: str) -> None:
         if not onnx_path.is_file():
@@ -281,7 +242,7 @@ class OnnxRegionDetector:
                 f"ONNX region model not found: {onnx_path}. "
                 f"Run: python scripts/export_region_onnx.py"
             )
-        self._session = _create_ort_session(onnx_path, ort_device)
+        self._session = create_ort_session(onnx_path, ort_device)
         self._input_name = self._session.get_inputs()[0].name
         self.active_providers: List[str] = list(self._session.get_providers())
         self._input_nchw = np.zeros(
