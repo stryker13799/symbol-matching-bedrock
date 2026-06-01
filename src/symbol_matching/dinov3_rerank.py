@@ -11,9 +11,9 @@ Export weights: ``python scripts/export_dino_onnx.py``
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence
 
 import cv2
 import numpy as np
@@ -67,12 +67,11 @@ class OnnxDinoEmbedder:
     def __init__(self, onnx_path: Path, ort_device: str) -> None:
         if not onnx_path.is_file():
             raise FileNotFoundError(
-                f"DINOv3 ONNX not found: {onnx_path}. "
-                "Run: python scripts/export_dino_onnx.py"
+                f"DINOv3 ONNX not found: {onnx_path}. Run: python scripts/export_dino_onnx.py"
             )
         self._session = create_ort_session(onnx_path, ort_device)
         self._input_name = self._session.get_inputs()[0].name
-        self.active_providers: List[str] = list(self._session.get_providers())
+        self.active_providers: list[str] = list(self._session.get_providers())
 
     def embed_batch(self, rgbs: Sequence[np.ndarray]) -> np.ndarray:
         """Return L2-normalized float32 embeddings of shape ``(len(rgbs), dim)``."""
@@ -98,10 +97,10 @@ class DinoRerankConfig:
 def rerank_template_hits_on_page(
     page_rgb: np.ndarray,
     exemplar_rgb: np.ndarray,
-    template_hits: List[MatchHit],
+    template_hits: list[MatchHit],
     embedder: OnnxDinoEmbedder,
     config: DinoRerankConfig,
-) -> List[MatchHit]:
+) -> list[MatchHit]:
     """Filter ``template_hits`` by DINOv3 cosine vs ``exemplar_rgb``.
 
     ``score`` on returned hits is DINO cosine (for viz, sorting, and export);
@@ -112,8 +111,8 @@ def rerank_template_hits_on_page(
 
     exemplar_emb = embedder.embed_batch([exemplar_rgb])[0]
 
-    crops: List[np.ndarray] = []
-    valid: List[MatchHit] = []
+    crops: list[np.ndarray] = []
+    valid: list[MatchHit] = []
     for h in template_hits:
         try:
             c = crop_rgb_owned(page_rgb, h.bbox)
@@ -138,8 +137,8 @@ def rerank_template_hits_on_page(
         all_sims[offset : offset + n] = sims
         offset += n
 
-    out: List[MatchHit] = []
-    for h, sim in zip(valid, all_sims):
+    out: list[MatchHit] = []
+    for h, sim in zip(valid, all_sims, strict=True):
         sim_f = float(sim)
         if sim_f < config.min_cosine:
             continue

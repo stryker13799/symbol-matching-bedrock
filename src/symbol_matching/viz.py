@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 from symbol_matching.models import BBox, MatchHit
 
 
-def _score_to_rgb(score: float) -> Tuple[int, int, int]:
+def _score_to_rgb(score: float) -> tuple[int, int, int]:
     clipped = max(0.0, min(1.0, float(score)))
     red = int(round(255.0 * (1.0 - clipped)))
     green = int(round(255.0 * clipped))
@@ -47,7 +47,7 @@ def save_png(image_rgb: np.ndarray, path: Path) -> None:
 
 def draw_region_proposals_on_page(
     page_rgb: np.ndarray,
-    detections: Sequence[Tuple[BBox, float]],
+    detections: Sequence[tuple[BBox, float]],
     search_rois: Sequence[BBox],
 ) -> np.ndarray:
     """Overlay ONNX region detections (green) and merged search ROI (cyan)."""
@@ -80,7 +80,7 @@ def draw_region_proposals_on_page(
     return np.asarray(pil, dtype=np.uint8)
 
 
-def draw_hits_on_page(page_rgb: np.ndarray, hits: List[MatchHit]) -> np.ndarray:
+def draw_hits_on_page(page_rgb: np.ndarray, hits: list[MatchHit]) -> np.ndarray:
     """Return a copy of ``page_rgb`` with one labeled box per hit."""
     pil = Image.fromarray(page_rgb.copy())
     drawer = ImageDraw.Draw(pil)

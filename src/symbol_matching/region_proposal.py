@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Protocol, Sequence, Tuple
+from typing import Protocol
 
 import cv2
 import numpy as np
@@ -43,8 +44,7 @@ class RegionDetector(Protocol):
         conf: float,
         iou_threshold: float,
         max_detections: int,
-    ) -> List[Tuple[float, float, float, float, float]]:
-        ...
+    ) -> list[tuple[float, float, float, float, float]]: ...
 
 
 def default_region_weights_path() -> Path:
@@ -64,16 +64,14 @@ def default_region_onnx_path() -> Path:
     return _DEFAULT_ONNX
 
 
-def preprocess_training_matched(page_rgb: np.ndarray) -> Tuple[np.ndarray, float, float]:
+def preprocess_training_matched(page_rgb: np.ndarray) -> tuple[np.ndarray, float, float]:
     """Grayscale, resize 640x640 stretch (not letterbox).
 
     Returns a single-channel ``(640, 640)`` uint8 image (not 3-channel RGB).
     """
     page_h, page_w = page_rgb.shape[:2]
     gray = cv2.cvtColor(page_rgb, cv2.COLOR_RGB2GRAY)
-    stretched = cv2.resize(
-        gray, (TRAIN_IMGSZ, TRAIN_IMGSZ), interpolation=cv2.INTER_LINEAR
-    )
+    stretched = cv2.resize(gray, (TRAIN_IMGSZ, TRAIN_IMGSZ), interpolation=cv2.INTER_LINEAR)
     scale_x = float(TRAIN_IMGSZ) / float(page_w)
     scale_y = float(TRAIN_IMGSZ) / float(page_h)
     return stretched, scale_x, scale_y
@@ -107,16 +105,16 @@ def infer_rgb_to_nchw_float(infer_rgb: np.ndarray) -> np.ndarray:
 
 
 def map_boxes_stretch_to_page(
-    boxes: Sequence[Tuple[float, float, float, float, float]],
+    boxes: Sequence[tuple[float, float, float, float, float]],
     scale_x: float,
     scale_y: float,
-) -> List[BBox]:
+) -> list[BBox]:
     if scale_x <= 0.0 or scale_y <= 0.0:
         raise ValueError("scale factors must be positive")
     inv_x = 1.0 / scale_x
     inv_y = 1.0 / scale_y
-    mapped: List[BBox] = []
-    for x1, y1, x2, y2, score in boxes:
+    mapped: list[BBox] = []
+    for x1, y1, x2, y2, _score in boxes:
         mapped.append(
             BBox(
                 x1=float(x1) * inv_x,
@@ -133,18 +131,18 @@ def _box_iou(a: BBox, b: BBox) -> float:
 
 
 def _nms_xyxy(
-    boxes: List[Tuple[float, float, float, float]],
-    scores: List[float],
+    boxes: list[tuple[float, float, float, float]],
+    scores: list[float],
     iou_threshold: float,
-) -> List[int]:
+) -> list[int]:
     if not boxes:
         return []
     order = sorted(range(len(boxes)), key=lambda i: scores[i], reverse=True)
-    keep: List[int] = []
+    keep: list[int] = []
     while order:
         i = order.pop(0)
         keep.append(i)
-        remaining: List[int] = []
+        remaining: list[int] = []
         for j in order:
             ax1, ay1, ax2, ay2 = boxes[i]
             bx1, by1, bx2, by2 = boxes[j]
@@ -165,7 +163,7 @@ def _nms_xyxy(
     return keep
 
 
-def _xywh_to_xyxy(cx: float, cy: float, w: float, h: float) -> Tuple[float, float, float, float]:
+def _xywh_to_xyxy(cx: float, cy: float, w: float, h: float) -> tuple[float, float, float, float]:
     half_w = w / 2.0
     half_h = h / 2.0
     return cx - half_w, cy - half_h, cx + half_w, cy + half_h
@@ -176,7 +174,7 @@ def _parse_yolo_onnx_output(
     conf: float,
     iou_threshold: float,
     max_detections: int,
-) -> List[Tuple[float, float, float, float, float]]:
+) -> list[tuple[float, float, float, float, float]]:
     arr = np.asarray(output, dtype=np.float32)
     if arr.ndim == 3:
         # Ultralytics ONNX: (1, 4+nc, num_anchors) e.g. (1, 5, 8400).
@@ -195,10 +193,7 @@ def _parse_yolo_onnx_output(
     cy = preds[:, 1]
     bw = preds[:, 2]
     bh = preds[:, 3]
-    if preds.shape[1] == 5:
-        scores_arr = preds[:, 4]
-    else:
-        scores_arr = np.max(preds[:, 4:], axis=1)
+    scores_arr = preds[:, 4] if preds.shape[1] == 5 else np.max(preds[:, 4:], axis=1)
 
     valid = (scores_arr >= conf) & (bw > 0.0) & (bh > 0.0)
     if not np.any(valid):
@@ -226,7 +221,7 @@ def _parse_yolo_onnx_output(
     y2 = y2[size_ok]
     scores_arr = scores_arr[size_ok]
 
-    boxes_xyxy = list(zip(x1.tolist(), y1.tolist(), x2.tolist(), y2.tolist()))
+    boxes_xyxy = list(zip(x1.tolist(), y1.tolist(), x2.tolist(), y2.tolist(), strict=True))
     scores_list = scores_arr.tolist()
     keep = _nms_xyxy(boxes_xyxy, scores_list, iou_threshold)[:max_detections]
     return [
@@ -244,10 +239,8 @@ class OnnxRegionDetector:
             )
         self._session = create_ort_session(onnx_path, ort_device)
         self._input_name = self._session.get_inputs()[0].name
-        self.active_providers: List[str] = list(self._session.get_providers())
-        self._input_nchw = np.zeros(
-            (1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ), dtype=np.float32
-        )
+        self.active_providers: list[str] = list(self._session.get_providers())
+        self._input_nchw = np.zeros((1, 3, TRAIN_IMGSZ, TRAIN_IMGSZ), dtype=np.float32)
 
     def detect_640(
         self,
@@ -255,13 +248,11 @@ class OnnxRegionDetector:
         conf: float,
         iou_threshold: float,
         max_detections: int,
-    ) -> List[Tuple[float, float, float, float, float]]:
+    ) -> list[tuple[float, float, float, float, float]]:
         if infer_rgb.ndim == 2:
             gray640_to_nchw(infer_rgb, self._input_nchw)
         elif infer_rgb.ndim == 3:
-            np.divide(
-                infer_rgb[:, :, 0], 255.0, out=self._input_nchw[0, 0], casting="unsafe"
-            )
+            np.divide(infer_rgb[:, :, 0], 255.0, out=self._input_nchw[0, 0], casting="unsafe")
             self._input_nchw[0, 1][:] = self._input_nchw[0, 0]
             self._input_nchw[0, 2][:] = self._input_nchw[0, 0]
         else:
@@ -280,11 +271,11 @@ def load_region_model(config: RegionProposalConfig) -> RegionDetector:
     return load_region_detector(config)
 
 
-def _nms_boxes(boxes: List[BBox], scores: List[float], iou_threshold: float) -> List[int]:
+def _nms_boxes(boxes: list[BBox], scores: list[float], iou_threshold: float) -> list[int]:
     if not boxes:
         return []
     order = sorted(range(len(boxes)), key=lambda i: scores[i], reverse=True)
-    keep: List[int] = []
+    keep: list[int] = []
     while order:
         i = order.pop(0)
         keep.append(i)
@@ -318,7 +309,7 @@ def detect_drawing_regions_scored(
     page_rgb: np.ndarray,
     detector: RegionDetector,
     config: RegionProposalConfig,
-) -> List[Tuple[BBox, float]]:
+) -> list[tuple[BBox, float]]:
     gray640, scale_x, scale_y = preprocess_training_matched(page_rgb)
     raw = detector.detect_640(
         gray640,
@@ -340,15 +331,15 @@ def detect_drawing_regions(
     page_rgb: np.ndarray,
     detector: RegionDetector,
     config: RegionProposalConfig,
-) -> List[BBox]:
+) -> list[BBox]:
     return [bbox for bbox, _ in detect_drawing_regions_scored(page_rgb, detector, config)]
 
 
 def resolve_page_regions(
     page_rgb: np.ndarray,
     config: RegionProposalConfig,
-    detector: Optional[RegionDetector],
-) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+    detector: RegionDetector | None,
+) -> tuple[list[tuple[BBox, float]], list[BBox]]:
     """Return ONNX detections (bbox, conf) and page-space search ROIs for matching."""
     page_h, page_w = page_rgb.shape[:2]
     full = full_page_bbox(page_w, page_h)
@@ -375,8 +366,8 @@ def resolve_page_regions(
 def resolve_page_search_rois(
     page_rgb: np.ndarray,
     config: RegionProposalConfig,
-    detector: Optional[RegionDetector],
-) -> List[BBox]:
+    detector: RegionDetector | None,
+) -> list[BBox]:
     """Return page-space ROIs to search (single union for template; SAM3 uses same list)."""
     _, search_rois = resolve_page_regions(page_rgb, config, detector)
     return search_rois

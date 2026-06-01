@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
-
 import cv2
 import numpy as np
 
@@ -21,20 +19,20 @@ def tile_origins(
     region_w: int,
     tile_size: int,
     overlap: int,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     """Return (x, y) top-left origins covering a region with the given overlap."""
     if tile_size <= overlap:
         raise ValueError("tile_size must exceed overlap")
     if region_h <= 0 or region_w <= 0:
         return []
     stride = tile_size - overlap
-    xs: List[int] = []
+    xs: list[int] = []
     x = 0
     while x + tile_size < region_w:
         xs.append(x)
         x += stride
     xs.append(max(0, region_w - tile_size))
-    ys: List[int] = []
+    ys: list[int] = []
     y = 0
     while y + tile_size < region_h:
         ys.append(y)

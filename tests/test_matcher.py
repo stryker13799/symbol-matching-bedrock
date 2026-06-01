@@ -38,8 +38,9 @@ def test_finds_planted_instances() -> None:
     for cx, cy in centers:
         nearest = min(
             hits,
-            key=lambda h: (((h.bbox.x1 + h.bbox.x2) / 2 - cx) ** 2
-                           + ((h.bbox.y1 + h.bbox.y2) / 2 - cy) ** 2),
+            key=lambda h: (
+                ((h.bbox.x1 + h.bbox.x2) / 2 - cx) ** 2 + ((h.bbox.y1 + h.bbox.y2) / 2 - cy) ** 2
+            ),
         )
         assert abs((nearest.bbox.x1 + nearest.bbox.x2) / 2 - cx) < 30
         assert abs((nearest.bbox.y1 + nearest.bbox.y2) / 2 - cy) < 30

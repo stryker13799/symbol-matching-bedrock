@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import streamlit as st
@@ -26,10 +26,14 @@ from symbol_matching.scope import (
 from symbol_matching.viz import crop_rgb, draw_hits_on_page
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
-_DEFAULT_PDF = _PROJECT_ROOT / "Sample_Input" / "17180_-_FULL_100_CD_SET_-_With_ADDENDUM_1_(1)_(dragged)_(3).pdf"
+_DEFAULT_PDF = (
+    _PROJECT_ROOT
+    / "Sample_Input"
+    / "17180_-_FULL_100_CD_SET_-_With_ADDENDUM_1_(1)_(dragged)_(3).pdf"
+)
 
-_OVERVIEW_MAX_SIDE = 900   # full-page thumbnail for picking ROI
-_ZOOM_MAX_SIDE = 900       # zoomed ROI for drawing the exemplar box
+_OVERVIEW_MAX_SIDE = 900  # full-page thumbnail for picking ROI
+_ZOOM_MAX_SIDE = 900  # zoomed ROI for drawing the exemplar box
 _CONTEXT_DISPLAY_PX = 600  # zoomed hit inspector panel width
 
 _SCOPE_LABELS = {
@@ -46,7 +50,7 @@ _ENGINE_LABELS = {
 
 
 @st.cache_data(show_spinner=False)
-def _render_pdf_cached(pdf_bytes: bytes, dpi: int, max_pages: int) -> List[RenderedPage]:
+def _render_pdf_cached(pdf_bytes: bytes, dpi: int, max_pages: int) -> list[RenderedPage]:
     tmp = _PROJECT_ROOT / "exports" / "_streamlit_tmp.pdf"
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_bytes(pdf_bytes)
@@ -73,8 +77,8 @@ def _resize_rgb(rgb: np.ndarray, scale: float) -> np.ndarray:
 
 
 def _last_rect_from_canvas(
-    canvas_json: Optional[dict],
-) -> Optional[Tuple[float, float, float, float]]:
+    canvas_json: dict | None,
+) -> tuple[float, float, float, float] | None:
     """Return (left, top, w, h) of the last drawn rect in canvas pixels, or None."""
     if canvas_json is None:
         return None
@@ -90,7 +94,7 @@ def _last_rect_from_canvas(
 
 
 def _canvas_rect_to_bbox(
-    rect: Tuple[float, float, float, float],
+    rect: tuple[float, float, float, float],
     inv_scale: float,
     offset_x: float = 0.0,
     offset_y: float = 0.0,
@@ -137,15 +141,17 @@ def _context_crop_with_box(
     return _resize_rgb(annotated, scale)
 
 
-def _show_results(state: Dict[str, Any], page_records: List[PageRecord]) -> None:
-    hits: List[MatchHit] = state["hits"]
+def _show_results(state: dict[str, Any], page_records: list[PageRecord]) -> None:
+    hits: list[MatchHit] = state["hits"]
     export = state["export"]
     artifacts = state["artifacts"]
-    rendered_map: Dict[str, RenderedPage] = state["rendered_map"]
+    rendered_map: dict[str, RenderedPage] = state["rendered_map"]
     page_lookup = {p.id: p for p in page_records}
 
     st.markdown("---")
-    st.success(f"Done — **{len(hits)} match(es)** across **{len(export.searched_page_ids)} page(s)**.")
+    st.success(
+        f"Done — **{len(hits)} match(es)** across **{len(export.searched_page_ids)} page(s)**."
+    )
 
     if hits and hits[0].dino_cosine is not None:
         st.caption(
@@ -192,7 +198,8 @@ def _show_results(state: Dict[str, Any], page_records: List[PageRecord]) -> None
         hit_page_ids,
         format_func=lambda pid: (
             f"{pid} | {page_lookup[pid].sheet_ref or '-'} | {page_lookup[pid].page_name}"
-            if pid in page_lookup else pid
+            if pid in page_lookup
+            else pid
         ),
         key="explorer_page",
     )
@@ -247,7 +254,9 @@ def _show_results(state: Dict[str, Any], page_records: List[PageRecord]) -> None
             raw = np.asarray(Image.open(selected.crop_path), dtype=np.uint8)
             # Scale up small crops so they're easy to inspect.
             s = min(6.0, 300.0 / max(raw.shape[1], 1))
-            st.image(_resize_rgb(raw, s), caption=f"Crop — {raw.shape[1]}×{raw.shape[0]} px", clamp=True)
+            st.image(
+                _resize_rgb(raw, s), caption=f"Crop — {raw.shape[1]}×{raw.shape[0]} px", clamp=True
+            )
         else:
             st.info("Crop file not found.")
 
@@ -352,7 +361,7 @@ def main() -> None:
             dino_batch = int(st.number_input("DINO batch size", 4, 128, 32, 4))
 
     # --- Load PDF ---
-    pdf_bytes: Optional[bytes] = None
+    pdf_bytes: bytes | None = None
     if uploaded is not None:
         pdf_bytes = uploaded.getvalue()
     elif _DEFAULT_PDF.is_file():

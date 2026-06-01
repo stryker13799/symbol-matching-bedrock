@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List
-
 from symbol_matching.models import PageRecord
 
 SCOPE_THIS_PAGE = "this_page"
@@ -15,10 +13,10 @@ ALL_SCOPES = (SCOPE_THIS_PAGE, SCOPE_SIMILAR_NAME, SCOPE_PAGE_TYPE, SCOPE_ALL_PA
 
 
 def select_pages_for_scope(
-    pages: List[PageRecord],
+    pages: list[PageRecord],
     reference_page_id: str,
     scope: str,
-) -> List[PageRecord]:
+) -> list[PageRecord]:
     """Return the page subset that the matcher should search."""
     refs = [page for page in pages if page.id == reference_page_id]
     if len(refs) != 1:

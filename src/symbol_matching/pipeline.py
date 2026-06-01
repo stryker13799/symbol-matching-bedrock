@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -51,7 +51,7 @@ class RunArtifacts:
     export_path: Path
     crops_dir: Path
     overlays_dir: Path
-    region_overlays_dir: Optional[Path]
+    region_overlays_dir: Path | None
 
 
 def _clamp_bbox(bbox: BBox, page: PageRecord) -> BBox:
@@ -63,9 +63,9 @@ def _clamp_bbox(bbox: BBox, page: PageRecord) -> BBox:
 
 
 def _hits_to_drawing_items(
-    page_hits: Sequence[Tuple[PageRecord, MatchHit, Path]],
-) -> List[DrawingItemExport]:
-    items: List[DrawingItemExport] = []
+    page_hits: Sequence[tuple[PageRecord, MatchHit, Path]],
+) -> list[DrawingItemExport]:
+    items: list[DrawingItemExport] = []
     for page, hit, crop_path in page_hits:
         item_id = f"item-{uuid.uuid4()}"
         cap = CaptureExport(
@@ -95,18 +95,18 @@ def _hits_to_drawing_items(
 
 
 def _run_template_page_pass(
-    page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]],
-    template_bank: Sequence[Tuple[np.ndarray, int, float]],
+    page_jobs: list[tuple[PageRecord, np.ndarray, list[BBox]]],
+    template_bank: Sequence[tuple[np.ndarray, int, float]],
     match_cfg: MatcherConfig,
     page_match_cfg: MatcherConfig,
     page_workers: int,
-    progress_cb: Optional[Callable[[str], None]],
+    progress_cb: Callable[[str], None] | None,
     progress_label: str,
-) -> List[Tuple[PageRecord, np.ndarray, List[MatchHit]]]:
+) -> list[tuple[PageRecord, np.ndarray, list[MatchHit]]]:
     """Template match each page; tile-parallel or page-parallel, not both."""
     bank_list = list(template_bank)
     if page_workers <= 1:
-        results: List[Tuple[PageRecord, np.ndarray, List[MatchHit]]] = []
+        results: list[tuple[PageRecord, np.ndarray, list[MatchHit]]] = []
         for page, page_rgb, search_rois in page_jobs:
             if progress_cb is not None:
                 progress_cb(f"{progress_label}: page {page.id}")
@@ -117,14 +117,12 @@ def _run_template_page_pass(
         return results
 
     payloads = [
-        (page_rgb, bank_list, page_match_cfg, search_rois)
-        for _, page_rgb, search_rois in page_jobs
+        (page_rgb, bank_list, page_match_cfg, search_rois) for _, page_rgb, search_rois in page_jobs
     ]
-    raw_by_index: Dict[int, List[MatchHit]] = {}
+    raw_by_index: dict[int, list[MatchHit]] = {}
     with ProcessPoolExecutor(max_workers=page_workers) as pool:
         future_to_idx = {
-            pool.submit(_template_match_page_entry, payloads[i]): i
-            for i in range(len(payloads))
+            pool.submit(_template_match_page_entry, payloads[i]): i for i in range(len(payloads))
         }
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
@@ -132,21 +130,18 @@ def _run_template_page_pass(
             if progress_cb is not None:
                 page = page_jobs[idx][0]
                 progress_cb(f"{progress_label}: finished page {page.id}")
-    return [
-        (page_jobs[i][0], page_jobs[i][1], raw_by_index[i])
-        for i in range(len(page_jobs))
-    ]
+    return [(page_jobs[i][0], page_jobs[i][1], raw_by_index[i]) for i in range(len(page_jobs))]
 
 
 def _persist_page_hits(
     page: PageRecord,
     page_rgb: np.ndarray,
-    raw_hits: List[MatchHit],
+    raw_hits: list[MatchHit],
     crops_dir: Path,
     overlays_dir: Path,
-) -> Tuple[List[MatchHit], List[Tuple[PageRecord, MatchHit, Path]]]:
-    enriched: List[Tuple[PageRecord, MatchHit, Path]] = []
-    final_hits: List[MatchHit] = []
+) -> tuple[list[MatchHit], list[tuple[PageRecord, MatchHit, Path]]]:
+    enriched: list[tuple[PageRecord, MatchHit, Path]] = []
+    final_hits: list[MatchHit] = []
     for raw in raw_hits:
         crop_path = crops_dir / f"{page.id}_{uuid.uuid4().hex[:12]}.png"
         save_png(crop_rgb(page_rgb, raw.bbox), crop_path)
@@ -167,20 +162,20 @@ def _persist_page_hits(
 
 
 def run_matching(
-    rendered: List[RenderedPage],
+    rendered: list[RenderedPage],
     reference_page_id: str,
     user_bbox: BBox,
-    searched_pages: List[PageRecord],
+    searched_pages: list[PageRecord],
     matcher_config: MatcherConfig,
     output_dir: Path,
     scope_label: str,
-    refined_bbox: Optional[BBox] = None,
+    refined_bbox: BBox | None = None,
     engine: str = ENGINE_TEMPLATE,
-    dino_rerank_config: Optional[object] = None,
-    region_config: Optional[RegionProposalConfig] = None,
-    progress_cb: Optional[callable] = None,
+    dino_rerank_config: object | None = None,
+    region_config: RegionProposalConfig | None = None,
+    progress_cb: callable | None = None,
     page_workers: int = 1,
-) -> Tuple[List[MatchHit], RunExport, RunArtifacts]:
+) -> tuple[list[MatchHit], RunExport, RunArtifacts]:
     """Run end-to-end matching and write JSON + crops + annotated overlays.
 
     ``engine`` is ``template`` (OpenCV only) or ``template+dino`` (template proposals
@@ -199,7 +194,7 @@ def run_matching(
     if effective_page_workers > 1:
         page_match_cfg = replace(match_cfg, tile_workers=1)
 
-    page_index: Dict[str, RenderedPage] = {p.record.id: p for p in rendered}
+    page_index: dict[str, RenderedPage] = {p.record.id: p for p in rendered}
     if reference_page_id not in page_index:
         raise ValueError(f"reference page id not in rendered set: {reference_page_id}")
 
@@ -211,34 +206,34 @@ def run_matching(
     overlays_dir = output_dir / "overlays"
     crops_dir.mkdir(parents=True, exist_ok=True)
     overlays_dir.mkdir(parents=True, exist_ok=True)
-    region_overlays_dir: Optional[Path] = None
+    region_overlays_dir: Path | None = None
     if region_config is not None and region_config.enabled:
         region_overlays_dir = output_dir / "region_overlays"
         region_overlays_dir.mkdir(parents=True, exist_ok=True)
 
-    all_hits: List[MatchHit] = []
-    enriched: List[Tuple[PageRecord, MatchHit, Path]] = []
+    all_hits: list[MatchHit] = []
+    enriched: list[tuple[PageRecord, MatchHit, Path]] = []
     model_path: str
 
     r_cfg = region_config if region_config is not None else RegionProposalConfig(enabled=False)
-    region_detector: Optional[object] = None
+    region_detector: object | None = None
     if r_cfg.enabled:
         region_detector = load_region_model(r_cfg)
         model_path_suffix = f"+onnx-region:{r_cfg.onnx_path.name}"
     else:
         model_path_suffix = ""
 
-    region_cache: Dict[str, Tuple[List[Tuple[BBox, float]], List[BBox]]] = {}
+    region_cache: dict[str, tuple[list[tuple[BBox, float]], list[BBox]]] = {}
 
     def _page_regions(
         page_id: str, page_rgb: np.ndarray
-    ) -> Tuple[List[Tuple[BBox, float]], List[BBox]]:
+    ) -> tuple[list[tuple[BBox, float]], list[BBox]]:
         cached = region_cache.get(page_id)
         if cached is not None:
             return cached
         if not r_cfg.enabled:
             page_h, page_w = page_rgb.shape[:2]
-            result: Tuple[List[Tuple[BBox, float]], List[BBox]] = (
+            result: tuple[list[tuple[BBox, float]], list[BBox]] = (
                 [],
                 [full_page_bbox(page_w, page_h)],
             )
@@ -254,7 +249,7 @@ def run_matching(
         overlay = draw_region_proposals_on_page(page_rgb, scored, search_rois)
         save_png(overlay, region_overlays_dir / f"{page.id}_regions.png")
 
-    dino_embedder: Optional[object] = None
+    dino_embedder: object | None = None
     if engine == ENGINE_TEMPLATE_DINO:
         from symbol_matching.dinov3_rerank import DinoRerankConfig, load_dinov3_embedder
 
@@ -265,7 +260,7 @@ def run_matching(
     if engine == ENGINE_TEMPLATE:
         template_bank = build_template_bank(exemplar_crop, match_cfg)
         model_path = f"opencv:matchTemplate:binary-ink{model_path_suffix}"
-        page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]] = []
+        page_jobs: list[tuple[PageRecord, np.ndarray, list[BBox]]] = []
         for page in searched_pages:
             if page.id not in page_index:
                 continue
@@ -293,7 +288,7 @@ def run_matching(
 
         template_bank = build_template_bank(exemplar_crop, match_cfg)
         d_cfg = dino_rerank_config if dino_rerank_config is not None else DinoRerankConfig()
-        dino_page_jobs: List[Tuple[PageRecord, np.ndarray, List[BBox]]] = []
+        dino_page_jobs: list[tuple[PageRecord, np.ndarray, list[BBox]]] = []
         for page in searched_pages:
             if page.id not in page_index:
                 continue
@@ -312,9 +307,7 @@ def run_matching(
         )
         for page, page_rgb, raw_template in template_results:
             if progress_cb is not None:
-                progress_cb(
-                    f"  {page.id}: {len(raw_template)} template hit(s) → DINOv3 rerank…"
-                )
+                progress_cb(f"  {page.id}: {len(raw_template)} template hit(s) → DINOv3 rerank…")
             raw_reranked = rerank_template_hits_on_page(
                 page_rgb,
                 exemplar_crop,
@@ -338,7 +331,12 @@ def run_matching(
 
     export = RunExport(
         reference_page_id=ref_page.record.id,
-        reference_bbox_xyxy=[exemplar_bbox.x1, exemplar_bbox.y1, exemplar_bbox.x2, exemplar_bbox.y2],
+        reference_bbox_xyxy=[
+            exemplar_bbox.x1,
+            exemplar_bbox.y1,
+            exemplar_bbox.x2,
+            exemplar_bbox.y2,
+        ],
         scope=scope_label,
         searched_page_ids=[p.id for p in searched_pages],
         model_path=model_path,

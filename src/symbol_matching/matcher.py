@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -13,7 +13,7 @@ import numpy as np
 from symbol_matching.models import BBox, MatchHit
 from symbol_matching.tiling import full_page_bbox, tile_is_blank, tile_origins
 
-_PEAK_KERNEL_CACHE: Dict[int, np.ndarray] = {}
+_PEAK_KERNEL_CACHE: dict[int, np.ndarray] = {}
 _RESERVED_CPU_CORES = 4
 
 
@@ -25,8 +25,8 @@ def max_parallel_workers() -> int:
 
 @dataclass(frozen=True)
 class MatcherConfig:
-    scales: Tuple[float, ...] = (0.85, 0.92, 1.0, 1.08, 1.18)
-    rotations_deg: Tuple[int, ...] = (0, 90, 180, 270)
+    scales: tuple[float, ...] = (0.85, 0.92, 1.0, 1.08, 1.18)
+    rotations_deg: tuple[int, ...] = (0, 90, 180, 270)
     score_threshold: float = 0.55
     nms_iou: float = 0.30
     max_hits_per_page: int = 200
@@ -53,7 +53,7 @@ class _TileJob:
     roi_offset_y: float
 
 
-def resolve_parallel_workers(tile_workers: int, page_workers: int) -> Tuple[int, int]:
+def resolve_parallel_workers(tile_workers: int, page_workers: int) -> tuple[int, int]:
     """Return (tile_workers, page_workers) without nested process pools."""
     tw = max(1, int(tile_workers))
     pw = max(1, int(page_workers))
@@ -78,7 +78,7 @@ def _to_ink_mask(rgb: np.ndarray) -> np.ndarray:
     return binary
 
 
-def _trim_to_ink(mask: np.ndarray, padding: int) -> Tuple[np.ndarray, Tuple[int, int]]:
+def _trim_to_ink(mask: np.ndarray, padding: int) -> tuple[np.ndarray, tuple[int, int]]:
     coords = cv2.findNonZero(mask)
     if coords is None:
         return mask, (0, 0)
@@ -127,18 +127,15 @@ def _peak_dilate_kernel(peak_radius: int) -> np.ndarray:
 
 
 def _scaled_template_bank(
-    template_bank: Sequence[Tuple[np.ndarray, int, float]],
+    template_bank: Sequence[tuple[np.ndarray, int, float]],
     page_scale: float,
-) -> List[Tuple[np.ndarray, int, float]]:
+) -> list[tuple[np.ndarray, int, float]]:
     if page_scale >= 1.0:
         return list(template_bank)
-    return [
-        (_scale_mask(tmpl, page_scale), rot, scale)
-        for tmpl, rot, scale in template_bank
-    ]
+    return [(_scale_mask(tmpl, page_scale), rot, scale) for tmpl, rot, scale in template_bank]
 
 
-def _keep_top_indices(scores: Sequence[float], limit: int) -> List[int]:
+def _keep_top_indices(scores: Sequence[float], limit: int) -> list[int]:
     n = len(scores)
     if n <= limit:
         return list(range(n))
@@ -146,12 +143,12 @@ def _keep_top_indices(scores: Sequence[float], limit: int) -> List[int]:
     return np.argpartition(score_arr, -limit)[-limit:].tolist()
 
 
-def _nms(boxes: List[BBox], scores: List[float], iou_threshold: float) -> List[int]:
+def _nms(boxes: list[BBox], scores: list[float], iou_threshold: float) -> list[int]:
     """Greedy NMS on xyxy boxes (fallback when OpenCV NMS is unavailable)."""
     if len(boxes) == 0:
         return []
     order = sorted(range(len(boxes)), key=lambda i: scores[i], reverse=True)
-    keep: List[int] = []
+    keep: list[int] = []
     while len(order) > 0:
         i = order.pop(0)
         keep.append(i)
@@ -159,7 +156,7 @@ def _nms(boxes: List[BBox], scores: List[float], iou_threshold: float) -> List[i
     return keep
 
 
-def _nms_opencv(boxes: List[BBox], scores: List[float], iou_threshold: float) -> List[int]:
+def _nms_opencv(boxes: list[BBox], scores: list[float], iou_threshold: float) -> list[int]:
     n = len(boxes)
     if n == 0:
         return []
@@ -185,12 +182,12 @@ def _nms_opencv(boxes: List[BBox], scores: List[float], iou_threshold: float) ->
 def build_template_bank(
     exemplar_rgb: np.ndarray,
     config: MatcherConfig,
-) -> List[Tuple[np.ndarray, int, float]]:
+) -> list[tuple[np.ndarray, int, float]]:
     mask = _to_ink_mask(exemplar_rgb)
     trimmed, _ = _trim_to_ink(mask, padding=2)
     if trimmed.size == 0 or trimmed.shape[0] < 4 or trimmed.shape[1] < 4:
         raise ValueError("exemplar contains no detectable ink; pick a tighter box")
-    bank: List[Tuple[np.ndarray, int, float]] = []
+    bank: list[tuple[np.ndarray, int, float]] = []
     for rot in config.rotations_deg:
         rotated = _rotate_mask(trimmed, rot)
         for scale in config.scales:
@@ -202,18 +199,18 @@ def build_template_bank(
 
 def _match_variants_on_tile(
     tile_mask: np.ndarray,
-    template_bank: Sequence[Tuple[np.ndarray, int, float]],
+    template_bank: Sequence[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
     page_scale: float,
     tile_offset_x: float,
     tile_offset_y: float,
     roi_offset_x: float,
     roi_offset_y: float,
-) -> Tuple[List[BBox], List[float], List[str]]:
+) -> tuple[list[BBox], list[float], list[str]]:
     work_h, work_w = tile_mask.shape
-    boxes: List[BBox] = []
-    scores: List[float] = []
-    sources: List[str] = []
+    boxes: list[BBox] = []
+    scores: list[float] = []
+    sources: list[str] = []
     inv = 1.0 / page_scale if page_scale < 1.0 else 1.0
 
     for tmpl, rot, scale in template_bank:
@@ -263,9 +260,9 @@ def _match_variants_on_tile(
 
 def _run_tile_job(
     job: _TileJob,
-    search_bank: List[Tuple[np.ndarray, int, float]],
+    search_bank: list[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
-) -> Tuple[List[BBox], List[float], List[str]]:
+) -> tuple[list[BBox], list[float], list[str]]:
     t_boxes, t_scores, t_sources = _match_variants_on_tile(
         job.tile_mask,
         search_bank,
@@ -285,8 +282,8 @@ def _run_tile_job(
 
 
 def _tile_worker_entry(
-    payload: Tuple[_TileJob, List[Tuple[np.ndarray, int, float]], MatcherConfig],
-) -> Tuple[List[BBox], List[float], List[str]]:
+    payload: tuple[_TileJob, list[tuple[np.ndarray, int, float]], MatcherConfig],
+) -> tuple[list[BBox], list[float], list[str]]:
     job, search_bank, config = payload
     return _run_tile_job(job, search_bank, config)
 
@@ -294,14 +291,14 @@ def _tile_worker_entry(
 def _collect_tile_jobs(
     work_mask: np.ndarray,
     work_rgb: np.ndarray,
-    origins: Sequence[Tuple[int, int]],
+    origins: Sequence[tuple[int, int]],
     config: MatcherConfig,
     page_scale: float,
     roi_offset_x: float,
     roi_offset_y: float,
-) -> List[_TileJob]:
+) -> list[_TileJob]:
     ts = config.tile_size
-    jobs: List[_TileJob] = []
+    jobs: list[_TileJob] = []
     for ox, oy in origins:
         tile_mask = work_mask[oy : oy + ts, ox : ox + ts]
         if tile_mask.shape[0] < 4 or tile_mask.shape[1] < 4:
@@ -326,16 +323,16 @@ def _collect_tile_jobs(
 
 
 def _match_tiles_parallel(
-    jobs: List[_TileJob],
-    search_bank: List[Tuple[np.ndarray, int, float]],
+    jobs: list[_TileJob],
+    search_bank: list[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
-) -> Tuple[List[BBox], List[float], List[str]]:
+) -> tuple[list[BBox], list[float], list[str]]:
     bank_list = list(search_bank)
     workers = max(1, int(config.tile_workers))
     if workers <= 1 or len(jobs) <= 1:
-        boxes: List[BBox] = []
-        scores: List[float] = []
-        sources: List[str] = []
+        boxes: list[BBox] = []
+        scores: list[float] = []
+        sources: list[str] = []
         for job in jobs:
             t_boxes, t_scores, t_sources = _run_tile_job(job, bank_list, config)
             boxes.extend(t_boxes)
@@ -359,11 +356,11 @@ def _match_tiles_parallel(
 
 
 def _truncate_candidate_lists(
-    boxes: List[BBox],
-    scores: List[float],
-    sources: List[str],
+    boxes: list[BBox],
+    scores: list[float],
+    sources: list[str],
     limit: int,
-) -> Tuple[List[BBox], List[float], List[str]]:
+) -> tuple[list[BBox], list[float], list[str]]:
     if len(boxes) <= limit:
         return boxes, scores, sources
     keep = _keep_top_indices(scores, limit)
@@ -376,10 +373,10 @@ def _truncate_candidate_lists(
 
 def match_exemplar_on_page(
     page_rgb: np.ndarray,
-    template_bank: Sequence[Tuple[np.ndarray, int, float]],
+    template_bank: Sequence[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
-    search_rois: Optional[List[BBox]] = None,
-) -> List[MatchHit]:
+    search_rois: list[BBox] | None = None,
+) -> list[MatchHit]:
     """Search inside region ROI(s) using tiled ink matching; skip near-blank tiles."""
     page_h, page_w = page_rgb.shape[:2]
     rois = search_rois if search_rois is not None else [full_page_bbox(page_w, page_h)]
@@ -426,9 +423,7 @@ def match_exemplar_on_page(
         roi_offset_x,
         roi_offset_y,
     )
-    boxes, scores, sources = _match_tiles_parallel(
-        tile_jobs, list(search_bank), config
-    )
+    boxes, scores, sources = _match_tiles_parallel(tile_jobs, list(search_bank), config)
 
     if len(boxes) == 0:
         return []
@@ -449,10 +444,10 @@ def match_exemplar_on_page(
 
 def template_match_page_task(
     page_rgb: np.ndarray,
-    template_bank: List[Tuple[np.ndarray, int, float]],
+    template_bank: list[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
-    search_rois: List[BBox],
-) -> List[MatchHit]:
+    search_rois: list[BBox],
+) -> list[MatchHit]:
     """Picklable entry point for per-page process pools."""
     return match_exemplar_on_page(
         page_rgb,
@@ -463,12 +458,12 @@ def template_match_page_task(
 
 
 def _template_match_page_entry(
-    payload: Tuple[
+    payload: tuple[
         np.ndarray,
-        List[Tuple[np.ndarray, int, float]],
+        list[tuple[np.ndarray, int, float]],
         MatcherConfig,
-        List[BBox],
+        list[BBox],
     ],
-) -> List[MatchHit]:
+) -> list[MatchHit]:
     page_rgb, template_bank, config, search_rois = payload
     return template_match_page_task(page_rgb, template_bank, config, search_rois)

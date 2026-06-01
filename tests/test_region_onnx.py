@@ -8,12 +8,12 @@ import pytest
 from symbol_matching.region_proposal import (
     TRAIN_IMGSZ,
     OnnxRegionDetector,
+    RegionProposalConfig,
     _parse_yolo_onnx_output,
     default_region_onnx_path,
     infer_rgb_to_nchw_float,
     load_region_detector,
     preprocess_training_matched,
-    RegionProposalConfig,
 )
 
 
@@ -63,9 +63,7 @@ def test_live_onnx_matches_exported_output_layout() -> None:
         pytest.skip(f"ONNX weights missing: {onnx_path}")
     det = OnnxRegionDetector(onnx_path, ort_device="cuda")
     assert det.active_providers[0] == "CUDAExecutionProvider"
-    gray640, _, _ = preprocess_training_matched(
-        np.full((3600, 5400, 3), 240, dtype=np.uint8)
-    )
+    gray640, _, _ = preprocess_training_matched(np.full((3600, 5400, 3), 240, dtype=np.uint8))
     hits = det.detect_640(gray640, 0.25, 0.45, 50)
     for x1, y1, x2, y2, score in hits:
         assert 0.0 <= x1 < x2 <= TRAIN_IMGSZ

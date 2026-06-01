@@ -5,13 +5,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
 
 import fitz  # PyMuPDF
 import numpy as np
 
 from symbol_matching.models import PageRecord
-
 
 # Sheet reference patterns commonly found in title blocks (e.g. E-201, M2.1, P-301).
 _SHEET_REF_PATTERNS = (
@@ -20,7 +18,7 @@ _SHEET_REF_PATTERNS = (
 )
 
 # Coarse pageType classification by keyword scan over page text.
-_PAGE_TYPE_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+_PAGE_TYPE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("plumbing", ("PLUMBING", "SANITARY", "DOMESTIC WATER")),
     ("electrical_lighting", ("LIGHTING",)),
     ("electrical_power", ("POWER",)),
@@ -120,7 +118,7 @@ def _plan_family(page_name_upper: str, page_type: str) -> str:
     return f"{page_type}:{cleaned.lower()}"
 
 
-def _pixmap_to_rgb(pix: "fitz.Pixmap") -> np.ndarray:
+def _pixmap_to_rgb(pix: fitz.Pixmap) -> np.ndarray:
     if pix.alpha:
         pix = fitz.Pixmap(fitz.csRGB, pix)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -129,7 +127,7 @@ def _pixmap_to_rgb(pix: "fitz.Pixmap") -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def render_pdf(pdf_path: Path, dpi: int, max_pages: int) -> List[RenderedPage]:
+def render_pdf(pdf_path: Path, dpi: int, max_pages: int) -> list[RenderedPage]:
     """Render up to ``max_pages`` from ``pdf_path`` at ``dpi`` resolution.
 
     Each page also gets a coarse metadata record inferred from its text content.
@@ -141,7 +139,7 @@ def render_pdf(pdf_path: Path, dpi: int, max_pages: int) -> List[RenderedPage]:
     if not pdf_path.is_file():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    pages: List[RenderedPage] = []
+    pages: list[RenderedPage] = []
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
 

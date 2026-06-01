@@ -279,6 +279,37 @@ For **`template`** or **`template+dino`**, the sidebar includes **Tile workers**
 
 ---
 
+## Development
+
+### One-time setup (run on every `git commit`)
+
+From the repo root, with your conda env active:
+
+```powershell
+uv pip install -e ".[dev]"
+uv run pre-commit install
+```
+
+That registers a Git hook. Each commit runs **Ruff** (lint with auto-fix, then format). Tests run on GitHub CI (and locally before push — see Tests). To run the same Ruff checks without committing:
+
+```powershell
+uv run pre-commit run --all-files
+```
+
+To skip hooks once (not recommended): `git commit --no-verify`.
+
+### Manual lint / format
+
+```powershell
+uv run ruff check .
+uv run ruff format --check .   # apply: uv run ruff format .
+```
+
+### Run on GitHub (CI)
+
+The workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every **push** and **pull request** to `main` or `master`:
+---
+
 ## Tests
 
 ```powershell

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Tuple
 
 import onnxruntime as ort
 
@@ -18,7 +17,7 @@ def preload_ort_cuda_dlls() -> None:
         preload_fn()
 
 
-def ort_session_providers(ort_device: str) -> List[str | Tuple[str, dict]]:
+def ort_session_providers(ort_device: str) -> list[str | tuple[str, dict]]:
     available = set(ort.get_available_providers())
     device = ort_device.strip().lower()
     if device in ("cuda", "gpu", "0"):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Tuple
 
 import fitz
 import numpy as np
@@ -48,7 +47,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _render_page_rgb(pdf_path: Path, page_index: int, dpi: int) -> Tuple[np.ndarray, int, int]:
+def _render_page_rgb(pdf_path: Path, page_index: int, dpi: int) -> tuple[np.ndarray, int, int]:
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
     with fitz.open(pdf_path) as doc:
@@ -74,7 +73,7 @@ def main() -> None:
     with fitz.open(args.pdf) as doc:
         page_count = min(doc.page_count, args.max_pages)
 
-    summary_lines: List[str] = [f"onnx={args.onnx} conf={args.conf} dpi={args.dpi}"]
+    summary_lines: list[str] = [f"onnx={args.onnx} conf={args.conf} dpi={args.dpi}"]
     for page_index in range(page_count):
         page_rgb, page_w, page_h = _render_page_rgb(args.pdf, page_index, args.dpi)
         scored, search_rois = resolve_page_regions(page_rgb, cfg, detector)

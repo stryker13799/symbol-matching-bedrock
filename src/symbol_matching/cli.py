@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
 
 import click
 
@@ -12,7 +11,6 @@ from symbol_matching.models import BBox
 from symbol_matching.pdf import render_pdf
 from symbol_matching.pipeline import (
     ALL_ENGINES,
-    ENGINE_TEMPLATE,
     ENGINE_TEMPLATE_DINO,
     run_matching,
 )
@@ -33,14 +31,14 @@ def _parse_bbox(raw: str) -> BBox:
     return BBox(x1=x1, y1=y1, x2=x2, y2=y2)
 
 
-def _parse_scales(raw: str) -> Tuple[float, ...]:
+def _parse_scales(raw: str) -> tuple[float, ...]:
     parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
     if len(parts) == 0:
         raise click.BadParameter("scales must contain at least one value")
     return tuple(float(p) for p in parts)
 
 
-def _parse_rotations(raw: str) -> Tuple[int, ...]:
+def _parse_rotations(raw: str) -> tuple[int, ...]:
     if raw == "rot4":
         return (0, 90, 180, 270)
     if raw in ("0", "none"):
@@ -51,51 +49,130 @@ def _parse_rotations(raw: str) -> Tuple[int, ...]:
 
 @click.command(name="symbol-match")
 @click.option("--pdf", "pdf_path", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--reference-page", "reference_page", type=int, required=True,
-              help="1-indexed page number containing the symbol exemplar.")
-@click.option("--bbox", "bbox_raw", type=str, required=True,
-              help="Exemplar box in rendered-page pixel coords: 'x1,y1,x2,y2'.")
-@click.option("--scope", "scope_label", type=click.Choice(ALL_SCOPES), default=SCOPE_ALL_PAGES,
-              show_default=True)
-@click.option("--output-dir", "output_dir", type=click.Path(path_type=Path),
-              default=Path("exports/cli_run"), show_default=True)
+@click.option(
+    "--reference-page",
+    "reference_page",
+    type=int,
+    required=True,
+    help="1-indexed page number containing the symbol exemplar.",
+)
+@click.option(
+    "--bbox",
+    "bbox_raw",
+    type=str,
+    required=True,
+    help="Exemplar box in rendered-page pixel coords: 'x1,y1,x2,y2'.",
+)
+@click.option(
+    "--scope",
+    "scope_label",
+    type=click.Choice(ALL_SCOPES),
+    default=SCOPE_ALL_PAGES,
+    show_default=True,
+)
+@click.option(
+    "--output-dir",
+    "output_dir",
+    type=click.Path(path_type=Path),
+    default=Path("exports/cli_run"),
+    show_default=True,
+)
 @click.option("--dpi", type=int, default=200, show_default=True)
 @click.option("--max-pages", type=int, default=20, show_default=True)
 @click.option("--max-search-side", type=int, default=3000, show_default=True)
-@click.option("--min-score", type=float, default=0.40, show_default=True,
-              help="Lower for higher recall.")
+@click.option(
+    "--min-score", type=float, default=0.40, show_default=True, help="Lower for higher recall."
+)
 @click.option("--nms-iou", type=float, default=0.30, show_default=True)
 @click.option("--max-hits-per-page", type=int, default=50, show_default=True)
-@click.option("--tile-workers", type=int, default=0, show_default=True,
-              help="Template tile process pool size; 0 uses min(4, CPU count − 4).")
-@click.option("--page-workers", type=int, default=0, show_default=True,
-              help="Template page process pool size; 0 uses min(2, CPU count − 4). "
-              "Page parallelism disables tile parallelism.")
-@click.option("--scales", "scales_raw", type=str, default="0.85,0.92,1.0,1.08,1.18",
-              show_default=True)
-@click.option("--rotations", "rotations_raw", type=str, default="rot4", show_default=True,
-              help="'rot4' for 0/90/180/270, '0' for none, or 'a,b,c'.")
-@click.option("--engine", "engine", type=click.Choice(ALL_ENGINES), default=ENGINE_TEMPLATE_DINO,
-              show_default=True, help="template: OpenCV only. template+dino: template then "
-              "DINOv3 ONNX cosine rerank (GPU).")
-@click.option("--yolo-regions/--no-yolo-regions", default=True, show_default=True,
-              help="Restrict search to YOLO 'drawing' region(s) per page (training-matched preprocess).")
-@click.option("--yolo-onnx", type=click.Path(path_type=Path), default=None,
-              help="Path to drawing-region ONNX model. Default: src/drawing_region_yolo_model/weights.onnx")
-@click.option("--yolo-conf", default=0.25, type=float, show_default=True,
-              help="Drawing-region detection confidence threshold.")
-@click.option("--yolo-padding-frac", default=0.02, type=float, show_default=True,
-              help="Pad merged drawing ROI by this fraction of page width/height.")
-@click.option("--yolo-ort-device", default="cuda", show_default=True,
-              help="ONNX Runtime device for region model: cuda or cpu.")
-@click.option("--dino-onnx", type=click.Path(path_type=Path), default=None,
-              help="DINOv3 ONNX path. Default: src/dinov3_weights/dinov3_vits16.onnx")
-@click.option("--dino-ort-device", default="cuda", show_default=True,
-              help="ONNX Runtime device for DINOv3: cuda or cpu.")
-@click.option("--dino-min-cosine", default=0.55, type=float, show_default=True,
-              help="Min cosine similarity vs user exemplar to keep a template hit.")
-@click.option("--dino-batch", default=32, type=int, show_default=True,
-              help="Crops per DINOv3 ONNX forward.")
+@click.option(
+    "--tile-workers",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Template tile process pool size; 0 uses min(4, CPU count − 4).",
+)
+@click.option(
+    "--page-workers",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Template page process pool size; 0 uses min(2, CPU count − 4). "
+    "Page parallelism disables tile parallelism.",
+)
+@click.option(
+    "--scales", "scales_raw", type=str, default="0.85,0.92,1.0,1.08,1.18", show_default=True
+)
+@click.option(
+    "--rotations",
+    "rotations_raw",
+    type=str,
+    default="rot4",
+    show_default=True,
+    help="'rot4' for 0/90/180/270, '0' for none, or 'a,b,c'.",
+)
+@click.option(
+    "--engine",
+    "engine",
+    type=click.Choice(ALL_ENGINES),
+    default=ENGINE_TEMPLATE_DINO,
+    show_default=True,
+    help="template: OpenCV only. template+dino: template then DINOv3 ONNX cosine rerank (GPU).",
+)
+@click.option(
+    "--yolo-regions/--no-yolo-regions",
+    default=True,
+    show_default=True,
+    help="Restrict search to YOLO 'drawing' region(s) per page (training-matched preprocess).",
+)
+@click.option(
+    "--yolo-onnx",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to drawing-region ONNX model. Default: src/drawing_region_yolo_model/weights.onnx",
+)
+@click.option(
+    "--yolo-conf",
+    default=0.25,
+    type=float,
+    show_default=True,
+    help="Drawing-region detection confidence threshold.",
+)
+@click.option(
+    "--yolo-padding-frac",
+    default=0.02,
+    type=float,
+    show_default=True,
+    help="Pad merged drawing ROI by this fraction of page width/height.",
+)
+@click.option(
+    "--yolo-ort-device",
+    default="cuda",
+    show_default=True,
+    help="ONNX Runtime device for region model: cuda or cpu.",
+)
+@click.option(
+    "--dino-onnx",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="DINOv3 ONNX path. Default: src/dinov3_weights/dinov3_vits16.onnx",
+)
+@click.option(
+    "--dino-ort-device",
+    default="cuda",
+    show_default=True,
+    help="ONNX Runtime device for DINOv3: cuda or cpu.",
+)
+@click.option(
+    "--dino-min-cosine",
+    default=0.55,
+    type=float,
+    show_default=True,
+    help="Min cosine similarity vs user exemplar to keep a template hit.",
+)
+@click.option(
+    "--dino-batch", default=32, type=int, show_default=True, help="Crops per DINOv3 ONNX forward."
+)
 def main(
     pdf_path: Path,
     reference_page: int,
@@ -114,11 +191,11 @@ def main(
     rotations_raw: str,
     engine: str,
     yolo_regions: bool,
-    yolo_onnx: Optional[Path],
+    yolo_onnx: Path | None,
     yolo_conf: float,
     yolo_padding_frac: float,
     yolo_ort_device: str,
-    dino_onnx: Optional[Path],
+    dino_onnx: Path | None,
     dino_ort_device: str,
     dino_min_cosine: float,
     dino_batch: int,

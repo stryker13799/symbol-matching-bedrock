@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 from pydantic import BaseModel
 
 
@@ -24,7 +22,7 @@ class BBox(BaseModel):
     def area(self) -> float:
         return self.width() * self.height()
 
-    def iou(self, other: "BBox") -> float:
+    def iou(self, other: BBox) -> float:
         ix1 = max(self.x1, other.x1)
         iy1 = max(self.y1, other.y1)
         ix2 = min(self.x2, other.x2)
@@ -63,18 +61,18 @@ class MatchHit(BaseModel):
     bbox: BBox
     score: float
     source: str
-    crop_path: Optional[str] = None
-    template_score: Optional[float] = None
-    dino_cosine: Optional[float] = None
+    crop_path: str | None = None
+    template_score: float | None = None
+    dino_cosine: float | None = None
 
 
 class CaptureExport(BaseModel):
     id: str
     page_id: str
-    bbox_xyxy: List[float]
+    bbox_xyxy: list[float]
     crop_path: str
     score: float
-    dino_cosine: Optional[float] = None
+    dino_cosine: float | None = None
 
 
 class DrawingItemExport(BaseModel):
@@ -83,20 +81,20 @@ class DrawingItemExport(BaseModel):
     page_name: str
     sheet_ref: str
     page_type: str
-    bbox_xyxy: List[float]
+    bbox_xyxy: list[float]
     score: float
     source: str
-    captures: List[CaptureExport]
-    template_score: Optional[float] = None
-    dino_cosine: Optional[float] = None
+    captures: list[CaptureExport]
+    template_score: float | None = None
+    dino_cosine: float | None = None
 
 
 class RunExport(BaseModel):
     """Full JSON export for a single run."""
 
     reference_page_id: str
-    reference_bbox_xyxy: List[float]
+    reference_bbox_xyxy: list[float]
     scope: str
-    searched_page_ids: List[str]
-    model_path: Optional[str]
-    hits: List[DrawingItemExport]
+    searched_page_ids: list[str]
+    model_path: str | None
+    hits: list[DrawingItemExport]
