@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cv2
@@ -14,7 +14,9 @@ from symbol_matching.models import BBox, MatchHit
 from symbol_matching.tiling import full_page_bbox, tile_is_blank_gray, tile_origins
 
 _PEAK_KERNEL_CACHE: dict[int, np.ndarray] = {}
+_PEAK_RADIUS_CACHE: dict[tuple[int, int, int], int] = {}
 _RESERVED_CPU_CORES = 4
+_OPENCV_THREADS_TILE_MODE = 1
 
 
 def max_parallel_workers() -> int:
@@ -137,6 +139,30 @@ def _peak_dilate_kernel(peak_radius: int) -> np.ndarray:
     return kernel
 
 
+def _peak_radius(template_h: int, template_w: int, peak_size_divisor: int) -> int:
+    div = max(2, int(peak_size_divisor))
+    key = (template_h, template_w, div)
+    cached = _PEAK_RADIUS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    radius = max(3, min(template_h, template_w) // div)
+    _PEAK_RADIUS_CACHE[key] = radius
+    return radius
+
+
+def _configure_opencv_threads(tile_workers: int, variant_workers: int) -> None:
+    if int(tile_workers) > 1 or int(variant_workers) > 1:
+        cv2.setNumThreads(_OPENCV_THREADS_TILE_MODE)
+    else:
+        cv2.setNumThreads(max_parallel_workers())
+
+
+def _variant_workers_for_config(tile_workers: int) -> int:
+    if int(tile_workers) > 1:
+        return 1
+    return min(4, max_parallel_workers())
+
+
 def _scaled_template_bank(
     template_bank: Sequence[tuple[np.ndarray, int, float]],
     page_scale: float,
@@ -204,8 +230,120 @@ def build_template_bank(
         for scale in config.scales:
             variant = _scale_mask(rotated, scale)
             if variant.shape[0] >= 4 and variant.shape[1] >= 4:
+                if not variant.flags["C_CONTIGUOUS"]:
+                    variant = np.ascontiguousarray(variant)
                 bank.append((variant, rot, scale))
     return bank
+
+
+def _peaks_from_correlation(
+    result: np.ndarray,
+    peak_radius: int,
+    score_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    kernel = _peak_dilate_kernel(peak_radius)
+    dilated = cv2.dilate(result, kernel)
+    peak_mask = (result >= score_threshold) & (result == dilated)
+    ys, xs = np.nonzero(peak_mask)
+    if ys.size == 0:
+        return ys, xs, np.empty(0, dtype=np.float32)
+    return ys, xs, result[ys, xs]
+
+
+def _boxes_from_peaks(
+    ys: np.ndarray,
+    xs: np.ndarray,
+    cand_scores: np.ndarray,
+    template_w: int,
+    template_h: int,
+    tile_offset_x: float,
+    tile_offset_y: float,
+    inv: float,
+    roi_offset_x: float,
+    roi_offset_y: float,
+) -> list[BBox]:
+    n = int(cand_scores.shape[0])
+    if n == 0:
+        return []
+    wx = xs.astype(np.float64) + tile_offset_x
+    wy = ys.astype(np.float64) + tile_offset_y
+    tw_f = float(template_w)
+    th_f = float(template_h)
+    x1s = wx * inv + roi_offset_x
+    y1s = wy * inv + roi_offset_y
+    x2s = (wx + tw_f) * inv + roi_offset_x
+    y2s = (wy + th_f) * inv + roi_offset_y
+    return [
+        BBox(
+            x1=float(x1s[i]),
+            y1=float(y1s[i]),
+            x2=float(x2s[i]),
+            y2=float(y2s[i]),
+        )
+        for i in range(n)
+    ]
+
+
+def _match_one_variant(
+    tile_mask: np.ndarray,
+    tmpl: np.ndarray,
+    rot: int,
+    scale: float,
+    work_h: int,
+    work_w: int,
+    threshold: float,
+    cap: int,
+    div: int,
+    inv: float,
+    tile_offset_x: float,
+    tile_offset_y: float,
+    roi_offset_x: float,
+    roi_offset_y: float,
+) -> tuple[list[BBox], list[float], list[str]]:
+    th, tw = tmpl.shape
+    if th < 4 or tw < 4 or th > work_h or tw > work_w:
+        return [], [], []
+    result = cv2.matchTemplate(tile_mask, tmpl, cv2.TM_CCOEFF_NORMED)
+    peak_radius = _peak_radius(th, tw, div)
+    ys, xs, cand_scores = _peaks_from_correlation(result, peak_radius, threshold)
+    if ys.size == 0:
+        return [], [], []
+    if ys.size > cap:
+        top_idx = np.argpartition(cand_scores, -cap)[-cap:]
+        ys = ys[top_idx]
+        xs = xs[top_idx]
+        cand_scores = cand_scores[top_idx]
+    source_tag = f"template:rot{rot}:s{scale:.2f}"
+    variant_boxes = _boxes_from_peaks(
+        ys, xs, cand_scores, tw, th, tile_offset_x, tile_offset_y, inv, roi_offset_x, roi_offset_y
+    )
+    n = len(variant_boxes)
+    return (
+        variant_boxes,
+        [float(cand_scores[i]) for i in range(n)],
+        [source_tag] * n,
+    )
+
+
+def _variant_worker_entry(
+    payload: tuple[
+        np.ndarray,
+        np.ndarray,
+        int,
+        float,
+        int,
+        int,
+        float,
+        int,
+        int,
+        float,
+        float,
+        float,
+        float,
+        float,
+    ],
+) -> tuple[list[BBox], list[float], list[str]]:
+    return _match_one_variant(*payload)
 
 
 def _match_variants_on_tile(
@@ -217,55 +355,70 @@ def _match_variants_on_tile(
     tile_offset_y: float,
     roi_offset_x: float,
     roi_offset_y: float,
+    variant_workers: int,
 ) -> tuple[list[BBox], list[float], list[str]]:
     work_h, work_w = tile_mask.shape
     boxes: list[BBox] = []
     scores: list[float] = []
     sources: list[str] = []
     inv = 1.0 / page_scale if page_scale < 1.0 else 1.0
+    threshold = float(config.score_threshold)
+    cap = int(config.max_candidates_per_variant)
+    div = int(config.peak_size_divisor)
 
+    if not tile_mask.flags["C_CONTIGUOUS"]:
+        tile_mask = np.ascontiguousarray(tile_mask)
+
+    payloads: list[
+        tuple[
+            np.ndarray,
+            np.ndarray,
+            int,
+            float,
+            int,
+            int,
+            float,
+            int,
+            int,
+            float,
+            float,
+            float,
+            float,
+            float,
+        ]
+    ] = []
     for tmpl, rot, scale in template_bank:
-        th, tw = tmpl.shape
-        if th < 4 or tw < 4 or th > work_h or tw > work_w:
-            continue
-        result = cv2.matchTemplate(tile_mask, tmpl, cv2.TM_CCOEFF_NORMED)
-        div = max(2, int(config.peak_size_divisor))
-        peak_radius = max(3, min(th, tw) // div)
-        dilated = cv2.dilate(result, _peak_dilate_kernel(peak_radius))
-        peak_mask = np.logical_and(
-            np.equal(result, dilated),
-            np.greater_equal(result, config.score_threshold),
-        )
-        ys, xs = np.nonzero(peak_mask)
-        if ys.size == 0:
-            continue
-        cand_scores = result[ys, xs]
-        cap = config.max_candidates_per_variant
-        if ys.size > cap:
-            top_idx = np.argpartition(cand_scores, -cap)[-cap:]
-            ys = ys[top_idx]
-            xs = xs[top_idx]
-            cand_scores = cand_scores[top_idx]
-        source_tag = f"template:rot{rot}:s{scale:.2f}"
-        wx = xs.astype(np.float64) + tile_offset_x
-        wy = ys.astype(np.float64) + tile_offset_y
-        tw_f = float(tw)
-        th_f = float(th)
-        x1s = wx * inv + roi_offset_x
-        y1s = wy * inv + roi_offset_y
-        x2s = (wx + tw_f) * inv + roi_offset_x
-        y2s = (wy + th_f) * inv + roi_offset_y
-        for i in range(int(cand_scores.shape[0])):
-            boxes.append(
-                BBox(
-                    x1=float(x1s[i]),
-                    y1=float(y1s[i]),
-                    x2=float(x2s[i]),
-                    y2=float(y2s[i]),
-                )
+        payloads.append(
+            (
+                tile_mask,
+                tmpl,
+                rot,
+                scale,
+                work_h,
+                work_w,
+                threshold,
+                cap,
+                div,
+                inv,
+                tile_offset_x,
+                tile_offset_y,
+                roi_offset_x,
+                roi_offset_y,
             )
-            scores.append(float(cand_scores[i]))
-            sources.append(source_tag)
+        )
+
+    if variant_workers <= 1 or len(payloads) <= 1:
+        for payload in payloads:
+            v_boxes, v_scores, v_sources = _match_one_variant(*payload)
+            boxes.extend(v_boxes)
+            scores.extend(v_scores)
+            sources.extend(v_sources)
+    else:
+        with ThreadPoolExecutor(max_workers=variant_workers) as pool:
+            for v_boxes, v_scores, v_sources in pool.map(_variant_worker_entry, payloads):
+                boxes.extend(v_boxes)
+                scores.extend(v_scores)
+                sources.extend(v_sources)
     return boxes, scores, sources
 
 
@@ -273,6 +426,7 @@ def _run_tile_job(
     job: _TileJob,
     search_bank: list[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
+    variant_workers: int,
 ) -> tuple[list[BBox], list[float], list[str]]:
     t_boxes, t_scores, t_sources = _match_variants_on_tile(
         job.tile_mask,
@@ -283,6 +437,7 @@ def _run_tile_job(
         job.oy,
         job.roi_offset_x,
         job.roi_offset_y,
+        variant_workers,
     )
     return _truncate_candidate_lists(
         t_boxes,
@@ -293,10 +448,16 @@ def _run_tile_job(
 
 
 def _tile_worker_entry(
-    payload: tuple[_TileJob, list[tuple[np.ndarray, int, float]], MatcherConfig],
+    payload: tuple[
+        _TileJob,
+        list[tuple[np.ndarray, int, float]],
+        MatcherConfig,
+        int,
+    ],
 ) -> tuple[list[BBox], list[float], list[str]]:
-    job, search_bank, config = payload
-    return _run_tile_job(job, search_bank, config)
+    job, search_bank, config, variant_workers = payload
+    _configure_opencv_threads(config.tile_workers, variant_workers)
+    return _run_tile_job(job, search_bank, config, variant_workers)
 
 
 def _collect_tile_jobs(
@@ -325,6 +486,8 @@ def _collect_tile_jobs(
                     continue
             else:
                 raise ValueError("work_gray is required when skip_blank_tiles is enabled")
+        if not tile_mask.flags["C_CONTIGUOUS"]:
+            tile_mask = np.ascontiguousarray(tile_mask)
         jobs.append(
             _TileJob(
                 tile_mask=tile_mask,
@@ -342,25 +505,30 @@ def _match_tiles_parallel(
     jobs: list[_TileJob],
     search_bank: list[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
+    variant_workers: int,
 ) -> tuple[list[BBox], list[float], list[str]]:
+    bank_list = list(search_bank)
     workers = max(1, int(config.tile_workers))
     if workers <= 1 or len(jobs) <= 1:
         boxes: list[BBox] = []
         scores: list[float] = []
         sources: list[str] = []
         for job in jobs:
-            t_boxes, t_scores, t_sources = _run_tile_job(job, search_bank, config)
+            t_boxes, t_scores, t_sources = _run_tile_job(job, bank_list, config, variant_workers)
             boxes.extend(t_boxes)
             scores.extend(t_scores)
             sources.extend(t_sources)
         return boxes, scores, sources
 
+    payloads = [(job, bank_list, config, 1) for job in jobs]
     boxes = []
     scores = []
     sources = []
-    payloads = [(job, search_bank, config) for job in jobs]
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for t_boxes, t_scores, t_sources in pool.map(_tile_worker_entry, payloads):
+    chunksize = max(1, len(payloads) // (workers * 4))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for t_boxes, t_scores, t_sources in pool.map(
+            _tile_worker_entry, payloads, chunksize=chunksize
+        ):
             boxes.extend(t_boxes)
             scores.extend(t_scores)
             sources.extend(t_sources)
@@ -429,6 +597,9 @@ def match_exemplar_on_page(
     overlap = min(config.tile_overlap, config.tile_size - 1)
     origins = tile_origins(work_h, work_w, config.tile_size, overlap)
 
+    variant_workers = _variant_workers_for_config(config.tile_workers)
+    _configure_opencv_threads(config.tile_workers, variant_workers)
+
     tile_jobs = _collect_tile_jobs(
         work_mask,
         work_gray,
@@ -438,7 +609,9 @@ def match_exemplar_on_page(
         roi_offset_x,
         roi_offset_y,
     )
-    boxes, scores, sources = _match_tiles_parallel(tile_jobs, search_bank, config)
+    boxes, scores, sources = _match_tiles_parallel(
+        tile_jobs, list(search_bank), config, variant_workers
+    )
 
     if len(boxes) == 0:
         return []
