@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
+from symbol_matching.exemplar import ensure_exemplar_rgb, locate_exemplar_bbox
 from symbol_matching.matcher import (
     MatcherConfig,
     _template_match_page_entry,
@@ -133,6 +134,26 @@ def _run_template_page_pass(
     return [(page_jobs[i][0], page_jobs[i][1], raw_by_index[i]) for i in range(len(page_jobs))]
 
 
+def _write_hit_crop(
+    page_rgb: np.ndarray,
+    page_id: str,
+    raw: MatchHit,
+    crops_dir: Path,
+) -> tuple[MatchHit, Path]:
+    crop_path = crops_dir / f"{page_id}_{uuid.uuid4().hex[:12]}.png"
+    save_png(crop_rgb(page_rgb, raw.bbox), crop_path)
+    hit = MatchHit(
+        page_id=page_id,
+        bbox=raw.bbox,
+        score=raw.score,
+        source=raw.source,
+        crop_path=str(crop_path),
+        template_score=raw.template_score,
+        dino_cosine=raw.dino_cosine,
+    )
+    return hit, crop_path
+
+
 def _persist_page_hits(
     page: PageRecord,
     page_rgb: np.ndarray,
@@ -140,23 +161,28 @@ def _persist_page_hits(
     crops_dir: Path,
     overlays_dir: Path,
 ) -> tuple[list[MatchHit], list[tuple[PageRecord, MatchHit, Path]]]:
+    if len(raw_hits) == 0:
+        return [], []
+
     enriched: list[tuple[PageRecord, MatchHit, Path]] = []
     final_hits: list[MatchHit] = []
-    for raw in raw_hits:
-        crop_path = crops_dir / f"{page.id}_{uuid.uuid4().hex[:12]}.png"
-        save_png(crop_rgb(page_rgb, raw.bbox), crop_path)
-        hit = MatchHit(
-            page_id=page.id,
-            bbox=raw.bbox,
-            score=raw.score,
-            source=raw.source,
-            crop_path=str(crop_path.resolve()),
-            template_score=raw.template_score,
-            dino_cosine=raw.dino_cosine,
-        )
+    if len(raw_hits) >= 2:
+        with ThreadPoolExecutor(max_workers=min(4, len(raw_hits))) as pool:
+            results = list(
+                pool.map(
+                    lambda raw: _write_hit_crop(page_rgb, page.id, raw, crops_dir),
+                    raw_hits,
+                )
+            )
+        for hit, crop_path in results:
+            final_hits.append(hit)
+            enriched.append((page, hit, crop_path))
+    else:
+        hit, crop_path = _write_hit_crop(page_rgb, page.id, raw_hits[0], crops_dir)
         final_hits.append(hit)
         enriched.append((page, hit, crop_path))
-    overlay = draw_hits_on_page(page_rgb, [h for _, h, _ in enriched])
+
+    overlay = draw_hits_on_page(page_rgb, final_hits)
     save_png(overlay, overlays_dir / f"{page.id}.png")
     return final_hits, enriched
 
@@ -164,7 +190,7 @@ def _persist_page_hits(
 def run_matching(
     rendered: list[RenderedPage],
     reference_page_id: str,
-    user_bbox: BBox,
+    user_bbox: BBox | None,
     searched_pages: list[PageRecord],
     matcher_config: MatcherConfig,
     output_dir: Path,
@@ -175,17 +201,22 @@ def run_matching(
     region_config: RegionProposalConfig | None = None,
     progress_cb: callable | None = None,
     page_workers: int = 1,
+    exemplar_rgb: np.ndarray | None = None,
 ) -> tuple[list[MatchHit], RunExport, RunArtifacts]:
     """Run end-to-end matching and write JSON + crops + annotated overlays.
 
     ``engine`` is ``template`` (OpenCV only) or ``template+dino`` (template proposals
     then DINOv3 ONNX cosine filter). For ``template+dino`` pass ``dino_rerank_config``.
+
+    Provide exactly one exemplar source: ``exemplar_rgb`` (e.g. a manual PNG crop) or
+    ``user_bbox`` on the reference page (Streamlit / CLI box). When both are set,
+    ``exemplar_rgb`` drives matching; ``user_bbox`` is only written to export JSON.
     """
     if engine not in ALL_ENGINES:
         raise ValueError(f"unsupported engine: {engine}; choose from {ALL_ENGINES}")
 
     tile_workers, effective_page_workers = resolve_parallel_workers(
-        matcher_config.tile_workers, page_workers
+        matcher_config.tile_workers, page_workers, len(searched_pages)
     )
     match_cfg = matcher_config
     if tile_workers != matcher_config.tile_workers:
@@ -199,8 +230,22 @@ def run_matching(
         raise ValueError(f"reference page id not in rendered set: {reference_page_id}")
 
     ref_page = page_index[reference_page_id]
-    exemplar_bbox = _clamp_bbox(refined_bbox or user_bbox, ref_page.record)
-    exemplar_crop = crop_rgb(ref_page.image_rgb, exemplar_bbox)
+    if exemplar_rgb is not None:
+        exemplar_crop = ensure_exemplar_rgb(exemplar_rgb)
+        if refined_bbox is not None:
+            exemplar_bbox = _clamp_bbox(refined_bbox, ref_page.record)
+        elif user_bbox is not None:
+            exemplar_bbox = _clamp_bbox(user_bbox, ref_page.record)
+        else:
+            located = locate_exemplar_bbox(
+                ref_page.image_rgb, exemplar_crop, matcher_config.max_search_side
+            )
+            exemplar_bbox = _clamp_bbox(located, ref_page.record)
+    elif user_bbox is not None:
+        exemplar_bbox = _clamp_bbox(refined_bbox or user_bbox, ref_page.record)
+        exemplar_crop = crop_rgb(ref_page.image_rgb, exemplar_bbox)
+    else:
+        raise ValueError("provide exemplar_rgb or user_bbox for the reference symbol")
 
     crops_dir = output_dir / "crops"
     overlays_dir = output_dir / "overlays"
@@ -288,6 +333,7 @@ def run_matching(
 
         template_bank = build_template_bank(exemplar_crop, match_cfg)
         d_cfg = dino_rerank_config if dino_rerank_config is not None else DinoRerankConfig()
+        exemplar_emb = dino_embedder.embed_batch([exemplar_crop])[0]
         dino_page_jobs: list[tuple[PageRecord, np.ndarray, list[BBox]]] = []
         for page in searched_pages:
             if page.id not in page_index:
@@ -314,6 +360,7 @@ def run_matching(
                 raw_template,
                 dino_embedder,
                 d_cfg,
+                exemplar_emb=exemplar_emb,
             )
             raw_reranked = raw_reranked[: match_cfg.max_hits_per_page]
             page_hits, page_enriched = _persist_page_hits(

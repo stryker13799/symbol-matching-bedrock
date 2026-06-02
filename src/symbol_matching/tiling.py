@@ -8,10 +8,13 @@ import numpy as np
 from symbol_matching.models import BBox
 
 
+def tile_is_blank_gray(tile_gray: np.ndarray, max_mean: float, max_std: float) -> bool:
+    return float(tile_gray.mean()) >= max_mean and float(tile_gray.std()) <= max_std
+
+
 def tile_is_blank(tile_rgb: np.ndarray, max_mean: float, max_std: float) -> bool:
     gray = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2GRAY)
-    mean, stddev = cv2.meanStdDev(gray)
-    return float(mean[0, 0]) >= max_mean and float(stddev[0, 0]) <= max_std
+    return tile_is_blank_gray(gray, max_mean, max_std)
 
 
 def tile_origins(

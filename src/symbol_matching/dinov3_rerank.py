@@ -100,6 +100,7 @@ def rerank_template_hits_on_page(
     template_hits: list[MatchHit],
     embedder: OnnxDinoEmbedder,
     config: DinoRerankConfig,
+    exemplar_emb: np.ndarray | None = None,
 ) -> list[MatchHit]:
     """Filter ``template_hits`` by DINOv3 cosine vs ``exemplar_rgb``.
 
@@ -109,10 +110,39 @@ def rerank_template_hits_on_page(
     if len(template_hits) == 0:
         return []
 
-    exemplar_emb = embedder.embed_batch([exemplar_rgb])[0]
+    query_emb = exemplar_emb
+    if query_emb is None:
+        query_emb = embedder.embed_batch([exemplar_rgb])[0]
 
-    crops: list[np.ndarray] = []
-    valid: list[MatchHit] = []
+    out: list[MatchHit] = []
+    bs = max(1, int(config.batch_size))
+    batch_crops: list[np.ndarray] = []
+    batch_hits: list[MatchHit] = []
+
+    def flush_batch() -> None:
+        if len(batch_crops) == 0:
+            return
+        emb = embedder.embed_batch(batch_crops)
+        sims = np.dot(emb, query_emb)
+        for h, sim in zip(batch_hits, sims, strict=True):
+            sim_f = float(sim)
+            if sim_f < config.min_cosine:
+                continue
+            t_score = float(h.score)
+            out.append(
+                MatchHit(
+                    page_id=h.page_id,
+                    bbox=h.bbox,
+                    score=sim_f,
+                    source=f"template+dino:{h.source}",
+                    crop_path=h.crop_path,
+                    template_score=t_score,
+                    dino_cosine=sim_f,
+                )
+            )
+        batch_crops.clear()
+        batch_hits.clear()
+
     for h in template_hits:
         try:
             c = crop_rgb_owned(page_rgb, h.bbox)
@@ -120,39 +150,10 @@ def rerank_template_hits_on_page(
             continue
         if c.size == 0:
             continue
-        crops.append(c)
-        valid.append(h)
-
-    if len(crops) == 0:
-        return []
-
-    all_sims = np.empty(len(crops), dtype=np.float32)
-    bs = max(1, int(config.batch_size))
-    offset = 0
-    for start in range(0, len(crops), bs):
-        chunk = crops[start : start + bs]
-        emb = embedder.embed_batch(chunk)
-        sims = np.dot(emb, exemplar_emb)
-        n = int(sims.shape[0])
-        all_sims[offset : offset + n] = sims
-        offset += n
-
-    out: list[MatchHit] = []
-    for h, sim in zip(valid, all_sims, strict=True):
-        sim_f = float(sim)
-        if sim_f < config.min_cosine:
-            continue
-        t_score = float(h.score)
-        out.append(
-            MatchHit(
-                page_id=h.page_id,
-                bbox=h.bbox,
-                score=sim_f,
-                source=f"template+dino:{h.source}",
-                crop_path=h.crop_path,
-                template_score=t_score,
-                dino_cosine=sim_f,
-            )
-        )
+        batch_crops.append(c)
+        batch_hits.append(h)
+        if len(batch_crops) >= bs:
+            flush_batch()
+    flush_batch()
     out.sort(key=lambda x: -x.score)
     return out

@@ -218,11 +218,13 @@ Writes `src/dinov3_weights/dinov3_vits16.onnx`. Override output with `--output`.
 symbol-match `
   --pdf "Sample_Input\17180_-_FULL_100_CD_SET_-_With_ADDENDUM_1_(1)_(dragged)_(3).pdf" `
   --reference-page 1 `
-  --bbox "6391,1124,6450,1183" `
+  --exemplar-crop "Sample_Input\example_input_crop.png" `
   --scope same_page_type `
   --output-dir "exports\run1" `
   --min-score 0.60
 ```
+
+Use `--bbox x1,y1,x2,y2` instead of `--exemplar-crop` when the exemplar comes from a box on the rendered page (Streamlit workflow). The sample PNG is a manual crop of the symbol; it is **not** the same as older README bbox coordinates.
 
 Notable flags:
 
@@ -249,18 +251,21 @@ Notable flags:
 | `--yolo-conf` | `0.25` | Region detection confidence |
 | `--yolo-padding-frac` | `0.02` | Pad merged drawing ROI (fraction of page size) |
 | `--yolo-ort-device` | `cuda` | ONNX Runtime EP for region model: `cuda` or `cpu` |
+| `--exemplar-crop` | — | PNG file used as template+DINO reference (e.g. `Sample_Input/example_input_crop.png`) |
 
 Example (multi-page template + parallelism):
 
 ```powershell
-symbol-match --pdf "Sample_Input\....pdf" --reference-page 1 --bbox "6391,1124,6450,1183" `
+symbol-match --pdf "Sample_Input\....pdf" --reference-page 1 `
+  --exemplar-crop "Sample_Input\example_input_crop.png" `
   --engine template --scope same_page_type --tile-workers 4 --page-workers 2 --output-dir exports\par_run
 ```
 
 Example (`template+dino`):
 
 ```powershell
-symbol-match --pdf "Sample_Input\....pdf" --reference-page 1 --bbox "6391,1124,6450,1183" `
+symbol-match --pdf "Sample_Input\....pdf" --reference-page 1 `
+  --exemplar-crop "Sample_Input\example_input_crop.png" `
   --engine template+dino --scope this_page --min-score 0.50 --dino-min-cosine 0.55 --output-dir exports\dino_run
 ```
 

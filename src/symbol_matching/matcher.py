@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from symbol_matching.models import BBox, MatchHit
-from symbol_matching.tiling import full_page_bbox, tile_is_blank, tile_origins
+from symbol_matching.tiling import full_page_bbox, tile_is_blank_gray, tile_origins
 
 _PEAK_KERNEL_CACHE: dict[int, np.ndarray] = {}
 _RESERVED_CPU_CORES = 4
@@ -53,15 +53,26 @@ class _TileJob:
     roi_offset_y: float
 
 
-def resolve_parallel_workers(tile_workers: int, page_workers: int) -> tuple[int, int]:
-    """Return (tile_workers, page_workers) without nested process pools."""
+def resolve_parallel_workers(
+    tile_workers: int,
+    page_workers: int,
+    num_pages: int,
+) -> tuple[int, int]:
+    """Return (tile_workers, page_workers) without nested process pools.
+
+    For small page counts, prefer tile parallelism (large sheets, one page at a time).
+    For many pages, prefer page parallelism.
+    """
     tw = max(1, int(tile_workers))
     pw = max(1, int(page_workers))
     cap = max_parallel_workers()
     pw = min(pw, cap)
     tw = min(tw, cap)
     if pw > 1 and tw > 1:
-        tw = 1
+        if num_pages <= 3:
+            pw = 1
+        else:
+            tw = 1
     return tw, pw
 
 
@@ -290,7 +301,7 @@ def _tile_worker_entry(
 
 def _collect_tile_jobs(
     work_mask: np.ndarray,
-    work_rgb: np.ndarray,
+    work_gray: np.ndarray | None,
     origins: Sequence[tuple[int, int]],
     config: MatcherConfig,
     page_scale: float,
@@ -303,15 +314,20 @@ def _collect_tile_jobs(
         tile_mask = work_mask[oy : oy + ts, ox : ox + ts]
         if tile_mask.shape[0] < 4 or tile_mask.shape[1] < 4:
             continue
-        if config.skip_blank_tiles and tile_is_blank(
-            work_rgb[oy : oy + ts, ox : ox + ts],
-            config.blank_tile_max_mean,
-            config.blank_tile_max_std,
-        ):
-            continue
+        if config.skip_blank_tiles:
+            if work_gray is not None:
+                tile_gray = work_gray[oy : oy + ts, ox : ox + ts]
+                if tile_is_blank_gray(
+                    tile_gray,
+                    config.blank_tile_max_mean,
+                    config.blank_tile_max_std,
+                ):
+                    continue
+            else:
+                raise ValueError("work_gray is required when skip_blank_tiles is enabled")
         jobs.append(
             _TileJob(
-                tile_mask=np.ascontiguousarray(tile_mask),
+                tile_mask=tile_mask,
                 ox=float(ox),
                 oy=float(oy),
                 page_scale=page_scale,
@@ -327,28 +343,24 @@ def _match_tiles_parallel(
     search_bank: list[tuple[np.ndarray, int, float]],
     config: MatcherConfig,
 ) -> tuple[list[BBox], list[float], list[str]]:
-    bank_list = list(search_bank)
     workers = max(1, int(config.tile_workers))
     if workers <= 1 or len(jobs) <= 1:
         boxes: list[BBox] = []
         scores: list[float] = []
         sources: list[str] = []
         for job in jobs:
-            t_boxes, t_scores, t_sources = _run_tile_job(job, bank_list, config)
+            t_boxes, t_scores, t_sources = _run_tile_job(job, search_bank, config)
             boxes.extend(t_boxes)
             scores.extend(t_scores)
             sources.extend(t_sources)
         return boxes, scores, sources
 
-    payloads = [(job, bank_list, config) for job in jobs]
     boxes = []
     scores = []
     sources = []
-    chunksize = max(1, len(payloads) // (workers * 4))
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        for t_boxes, t_scores, t_sources in pool.map(
-            _tile_worker_entry, payloads, chunksize=chunksize
-        ):
+    payloads = [(job, search_bank, config) for job in jobs]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for t_boxes, t_scores, t_sources in pool.map(_tile_worker_entry, payloads):
             boxes.extend(t_boxes)
             scores.extend(t_scores)
             sources.extend(t_sources)
@@ -408,6 +420,9 @@ def match_exemplar_on_page(
     work_mask = _to_ink_mask(work_rgb)
     work_h, work_w = work_mask.shape
     search_bank = _scaled_template_bank(template_bank, page_scale)
+    work_gray: np.ndarray | None = None
+    if config.skip_blank_tiles:
+        work_gray = cv2.cvtColor(work_rgb, cv2.COLOR_RGB2GRAY)
 
     if config.tile_size <= 0:
         raise ValueError("tile_size must be positive")
@@ -416,14 +431,14 @@ def match_exemplar_on_page(
 
     tile_jobs = _collect_tile_jobs(
         work_mask,
-        work_rgb,
+        work_gray,
         origins,
         config,
         page_scale,
         roi_offset_x,
         roi_offset_y,
     )
-    boxes, scores, sources = _match_tiles_parallel(tile_jobs, list(search_bank), config)
+    boxes, scores, sources = _match_tiles_parallel(tile_jobs, search_bank, config)
 
     if len(boxes) == 0:
         return []

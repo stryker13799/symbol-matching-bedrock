@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -42,7 +43,7 @@ def save_png(image_rgb: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not image_rgb.flags["C_CONTIGUOUS"]:
         image_rgb = np.ascontiguousarray(image_rgb)
-    Image.fromarray(image_rgb).save(path, format="PNG")
+    Image.fromarray(image_rgb).save(path, format="PNG", compress_level=1)
 
 
 def draw_region_proposals_on_page(
@@ -82,15 +83,27 @@ def draw_region_proposals_on_page(
 
 def draw_hits_on_page(page_rgb: np.ndarray, hits: list[MatchHit]) -> np.ndarray:
     """Return a copy of ``page_rgb`` with one labeled box per hit."""
-    pil = Image.fromarray(page_rgb.copy())
-    drawer = ImageDraw.Draw(pil)
+    if len(hits) == 0:
+        return page_rgb.copy()
+    out = np.ascontiguousarray(page_rgb.copy())
     line_width = max(2, min(page_rgb.shape[:2]) // 600)
+    font_scale = max(0.35, line_width / 4.0)
     for hit in hits:
         color = _score_to_rgb(hit.score)
-        drawer.rectangle(
-            [(hit.bbox.x1, hit.bbox.y1), (hit.bbox.x2, hit.bbox.y2)],
-            outline=color,
-            width=line_width,
+        bgr = (color[2], color[1], color[0])
+        x1 = int(max(0, np.floor(hit.bbox.x1)))
+        y1 = int(max(0, np.floor(hit.bbox.y1)))
+        x2 = int(np.ceil(hit.bbox.x2))
+        y2 = int(np.ceil(hit.bbox.y2))
+        cv2.rectangle(out, (x1, y1), (x2, y2), bgr, line_width)
+        cv2.putText(
+            out,
+            f"{hit.score:.2f}",
+            (x1 + 4, y1 + 4 + int(12 * font_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            bgr,
+            1,
+            cv2.LINE_AA,
         )
-        drawer.text((hit.bbox.x1 + 4, hit.bbox.y1 + 4), f"{hit.score:.2f}", fill=color)
-    return np.asarray(pil, dtype=np.uint8)
+    return out

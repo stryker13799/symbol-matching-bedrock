@@ -60,8 +60,15 @@ def _parse_rotations(raw: str) -> tuple[int, ...]:
     "--bbox",
     "bbox_raw",
     type=str,
-    required=True,
-    help="Exemplar box in rendered-page pixel coords: 'x1,y1,x2,y2'.",
+    default=None,
+    help="Exemplar box on the reference page: 'x1,y1,x2,y2'. Required unless --exemplar-crop.",
+)
+@click.option(
+    "--exemplar-crop",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="PNG exemplar for template+DINO (e.g. Sample_Input/example_input_crop.png). "
+    "Matching uses this image; --bbox is optional and only sets export reference_bbox.",
 )
 @click.option(
     "--scope",
@@ -199,9 +206,12 @@ def main(
     dino_ort_device: str,
     dino_min_cosine: float,
     dino_batch: int,
+    exemplar_crop: Path | None,
 ) -> None:
     """Run one-shot symbol matching on a PDF drawing set."""
-    user_bbox = _parse_bbox(bbox_raw)
+    if exemplar_crop is None and bbox_raw is None:
+        raise click.BadParameter("provide --bbox and/or --exemplar-crop")
+    user_bbox = _parse_bbox(bbox_raw) if bbox_raw is not None else None
     parallel_cap = max_parallel_workers()
     resolved_tile_workers = (
         min(parallel_cap, tile_workers) if tile_workers > 0 else min(4, parallel_cap)
@@ -279,6 +289,15 @@ def main(
             f"batch={dino_batch}, ort_device={dino_ort_device}"
         )
 
+    exemplar_rgb = None
+    if exemplar_crop is not None:
+        from symbol_matching.exemplar import load_exemplar_rgb
+
+        exemplar_rgb = load_exemplar_rgb(exemplar_crop)
+        click.echo(
+            f"Exemplar PNG: {exemplar_crop} ({exemplar_rgb.shape[1]}x{exemplar_rgb.shape[0]} px)"
+        )
+
     hits, export, artifacts = run_matching(
         rendered=rendered,
         reference_page_id=ref_page_record.id,
@@ -292,6 +311,7 @@ def main(
         dino_rerank_config=dino_engine_cfg,
         region_config=region_cfg,
         page_workers=resolved_page_workers,
+        exemplar_rgb=exemplar_rgb,
     )
 
     click.echo(f"Done. {len(hits)} match(es) across {len(export.searched_page_ids)} page(s).")
