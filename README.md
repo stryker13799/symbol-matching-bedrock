@@ -1,6 +1,6 @@
 # Symbol Matching — Technical Report & Code Demo
 
-A bare-minimum proof of concept for the symbol-matching takehome: given a PDF
+A bare-minimum proof of concept for symbol-matching: given a PDF
 drawing set, a reference page, and a user-drawn box around a symbol, find every
 matching instance across a scoped subset of pages and export results.
 
@@ -17,6 +17,44 @@ matching instance across a scoped subset of pages and export results.
   - **`template`** — OpenCV binary template matching on ink masks (CPU).
   - **`template+dino`** (default) — template matching **only proposes** candidates (`--min-score` on template correlation); [DINOv3 ViT-S/16](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m) **ONNX** cosine vs the exemplar **filters, ranks, and scores** hits (`--dino-min-cosine`); exported `score` and overlay coloring follow **DINO cosine**; `template_score` is diagnostic.
 
+---
+
+## Example output
+
+### Exemplar (input symbol)
+
+User crop used as the template + DINO reference (`Sample_Input/example_input_crop.png`):
+
+![Exemplar symbol crop](Sample_Input/example_input_crop.png)
+
+### Run summary
+
+| Page | Sheet | Page name | Hits |
+|------|-------|-----------|------|
+| p1 | P-120 | SECOND FLOOR CONSTRUCTION PLAN | 18 |
+| p2 | P-121 | SECOND FLOOR CONSTRUCTION PLAN | 26 |
+| p3 | P-130 | THIRD FLOOR CONSTRUCTION PLAN | 21 |
+
+- **Scope:** `all_pages` (3 pages searched: p1–p3)
+- **Reference page:** p1
+- **Engine:** `template+dino` (template proposals + DINOv3 cosine rerank)
+- **Total hits:** 65
+
+### Per-page overlays
+
+Boxes are colored by DINO cosine (green = high confidence). Full PNGs: `exports/streamlit_run/overlays/p1.png`, `p2.png`, `p3.png`.
+
+**p1 — P-120 (SECOND FLOOR CONSTRUCTION PLAN)**
+
+![p1 overlay](readme_assets/streamlit_run_demo/p1_overlay.jpg)
+
+**p2 — P-121 (SECOND FLOOR CONSTRUCTION PLAN)**
+
+![p2 overlay](readme_assets/streamlit_run_demo/p2_overlay.jpg)
+
+**p3 — P-130 (THIRD FLOOR CONSTRUCTION PLAN)**
+
+![p3 overlay](readme_assets/streamlit_run_demo/p3_overlay.jpg)
 ---
 
 ## Technical report
